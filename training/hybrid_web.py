@@ -226,6 +226,59 @@ class DeployedActor:
         )
 
 
+def fill_from_export(model: nn.Module, weights: Path, manifest: Path,
+                     allow_missing: tuple[str, ...] = ()) -> dict:
+    """Copy the browser's weights into any module that names its tensors the
+    same way, and return the manifest.
+
+    `duel_ppo.ActorCritic` qualifies as well as `HybridActor` — that is the
+    point of it, since warm-starting a run is the only reason to rebuild this
+    architecture at all. The export carries no critic and no optimiser state,
+    so a trainer passes the keys it expects to be missing; anything missing
+    that was *not* declared is a mismatch and raises, because a silently
+    partial `state_dict` load is the exact failure `export_hybrid_web.py`
+    warns about.
+    """
+    meta = json.loads(Path(manifest).read_text())
+    if meta["schema"] != 24 or meta["observation"] != OBS_DIM or meta["actions"] != ACTIONS:
+        raise ValueError(
+            f"manifest is schema {meta['schema']}/{meta['observation']}/{meta['actions']}, "
+            f"not 24/{OBS_DIM}/{ACTIONS}"
+        )
+    gated = meta.get("gated", {})
+    if not (gated.get("dodge") and gated.get("ammo")):
+        raise ValueError(
+            "this loader only fills the gated architecture; the manifest says "
+            f"dodge={gated.get('dodge')} ammo={gated.get('ammo')}"
+        )
+
+    blob = np.fromfile(Path(weights), dtype="<f4")
+    if blob.size != meta["floats"]:
+        raise ValueError(f"{weights} holds {blob.size} floats, manifest says {meta['floats']}")
+
+    state = model.state_dict()
+    loaded = {}
+    for name, spec in meta["tensors"].items():
+        if name not in state:
+            raise KeyError(f"manifest tensor {name!r} has nowhere to go in {type(model).__name__}")
+        flat = blob[spec["offset"]:spec["offset"] + spec["length"]]
+        value = torch.from_numpy(flat.reshape(spec["shape"]).copy())
+        if value.shape != state[name].shape:
+            raise ValueError(
+                f"{name}: manifest shape {tuple(value.shape)} != "
+                f"model shape {tuple(state[name].shape)}"
+            )
+        loaded[name] = value
+
+    missing = sorted(set(state) - set(loaded))
+    unexpected = [name for name in missing
+                  if not any(name == k or name.startswith(k + ".") for k in allow_missing)]
+    if unexpected:
+        raise KeyError(f"the export has no weights for {unexpected}")
+    model.load_state_dict(loaded, strict=False)
+    return meta
+
+
 def load_deployed_actor(
     weights: Path = DEFAULT_WEIGHTS,
     manifest: Path = DEFAULT_MANIFEST,

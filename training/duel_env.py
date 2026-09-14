@@ -26,7 +26,23 @@ BULLET_OFFSET = 900
 BULLET_DIM = 10
 BULLET_BLOCK = BULLET_SLOTS * BULLET_DIM        # 100
 # Everything that is neither the map grid nor the bullet rows.
-SCALAR_DIM = OBS_DIM - MAP_DIM - BULLET_BLOCK   # 70
+SCALAR_DIM = OBS_DIM - MAP_DIM - BULLET_BLOCK   # 88
+
+# Slots the actor's gates read straight out of the observation rather than
+# through the trunk. `score::dodge_safety`'s per-movement survival outlook is
+# already in here — the browser slices it out and hands it to the policy
+# separately, but it is the same nine numbers, so the trainer just reads them
+# in place. Mirrored from duel_obs.rs; the engine's reported OBS_DIM is the
+# check that they still line up.
+DODGE_OFFSET = 1018
+DODGE_DIM = 9
+IDLE_STREAK_INDEX = 1027
+# The fire gate's five inputs: ammo fraction, predicted hit, predicted self
+# hit, and the shot's time of flight.
+AMMO_INDEX = 863
+HIT_INDEX = 890
+SUICIDE_INDEX = 891
+ETA_INDEX = 893
 
 OUTCOME_NAMES = {0: "running", 1: "win", 2: "loss", 3: "double", 4: "draw"}
 OPPONENT_NAMES = {0: "laika", 1: "mpc", 2: "frozen"}
@@ -65,6 +81,11 @@ class DuelVec:
             int(self.lib.kf_duel_obs_schema_version()),
         )
         expected = (OBS_DIM, BULLET_SLOTS, ACTIONS, OBS_SCHEMA_VERSION)
+        if IDLE_STREAK_INDEX != OBS_DIM - 1 or DODGE_OFFSET + DODGE_DIM != IDLE_STREAK_INDEX:
+            raise RuntimeError(
+                "the gate offsets do not tile the end of the observation; "
+                "duel_obs.rs moved them and duel_env.py was not updated"
+            )
         if native != expected:
             raise RuntimeError(
                 f"engine/python schema mismatch: {native} != {expected}. "

@@ -12,7 +12,11 @@ use crate::duel::{
     apply_duel_action, duel_game, duel_settle, DuelState, Opponent, DUEL_ACTIONS,
     DUEL_FRAMES, DUEL_GRACE_FRAMES,
 };
-use crate::duel_obs::{encode, DuelObservation, BULLET_SLOTS, OBS_DIM, OBS_SCHEMA_VERSION};
+use crate::duel_obs::{
+    encode, DuelObservation, BULLET_SLOTS, DODGE_DIM, DODGE_OFFSET, OBS_DIM,
+    OBS_SCHEMA_VERSION,
+};
+use crate::score::{dodge_safety, DODGE_HORIZON};
 use crate::game::Game;
 use crate::rng::Rng;
 
@@ -158,6 +162,20 @@ impl DuelVecEnv {
 
     /// Encode into the slot's own buffer. Touches nothing shared, so this is
     /// what runs on the worker threads.
+    /// `encode` does not fill the dodge block. Schema 24 appended nine
+    /// per-movement survival outlooks from `score::dodge_safety`, but they are
+    /// a search result rather than a reading of the world, so the encoder
+    /// documents the slots and leaves writing them to the caller —
+    /// `kf_hybrid_observation` does exactly this for the browser. This file
+    /// was written against schema 20, before those channels existed, and so
+    /// published zeros there: the policy lost the input its dodge gate is
+    /// built on, and every gated checkpoint evaluated through this environment
+    /// scored far below what it plays at in the page.
+    fn fill_dodge(game: &Game, tank: usize, out: &mut DuelObservation) {
+        let dodge = dodge_safety(game, tank, DODGE_HORIZON);
+        out.values[DODGE_OFFSET..DODGE_OFFSET + DODGE_DIM].copy_from_slice(&dodge);
+    }
+
     fn encode_into_slot(slot: &mut Slot) {
         encode(
             &slot.game,
@@ -171,6 +189,7 @@ impl DuelVecEnv {
             &slot.state.own_history(),
             &mut slot.observation,
         );
+        Self::fill_dodge(&slot.game, 0, &mut slot.observation);
         if slot.state.opponent.is_external() {
             encode(
                 &slot.game,
@@ -180,6 +199,7 @@ impl DuelVecEnv {
                 &slot.state.opponent_history(),
                 &mut slot.observation_opponent,
             );
+            Self::fill_dodge(&slot.game, 1, &mut slot.observation_opponent);
         }
     }
 
@@ -672,5 +692,53 @@ mod tests {
         assert_eq!(kf_duel_bullet_slots() as usize, BULLET_SLOTS);
         assert_eq!(kf_duel_action_count() as usize, DUEL_ACTIONS);
         assert_eq!(kf_duel_obs_schema_version(), OBS_SCHEMA_VERSION);
+    }
+
+    /// The dodge block must actually carry `score::dodge_safety`.
+    ///
+    /// `encode` leaves those nine channels alone — the browser's
+    /// `kf_hybrid_observation` fills them itself — so an environment that
+    /// forgets to do the same publishes a structurally valid observation with
+    /// a hole in it. Nothing errors: the policy simply loses the input its
+    /// dodge gate multiplies, and a gated checkpoint that plays at 96% against
+    /// Laika in the page evaluates at 42% here. That is the failure this
+    /// guards, and it is invisible without it.
+    #[test]
+    fn the_published_observation_carries_the_dodge_block() {
+        unsafe {
+            // Pure Laika, so nothing depends on a caller supplying actions.
+            let env = kf_duel_new(16, 4242, 1000, 0, 0, 1);
+            let actions = vec![8u16; 16];
+            let mut filled = 0;
+            for _ in 0..120 {
+                kf_duel_step(env, actions.as_ptr(), std::ptr::null());
+                kf_duel_reset_done(env);
+                let obs = std::slice::from_raw_parts(kf_duel_obs(env), 16 * OBS_DIM);
+                filled = (0..16)
+                    .map(|slot| {
+                        let base = slot * OBS_DIM + DODGE_OFFSET;
+                        obs[base..base + DODGE_DIM].iter().filter(|v| **v != 0.0).count()
+                    })
+                    .sum::<usize>();
+                if filled > 0 {
+                    break;
+                }
+            }
+            assert!(
+                filled > 0,
+                "every dodge channel stayed zero across 120 frames; \
+                 encode_into_slot is not calling dodge_safety"
+            );
+            // And they are a survival probability, so they have to be bounded.
+            let obs = std::slice::from_raw_parts(kf_duel_obs(env), 16 * OBS_DIM);
+            for slot in 0..16 {
+                let base = slot * OBS_DIM + DODGE_OFFSET;
+                for value in &obs[base..base + DODGE_DIM] {
+                    assert!(value.is_finite(), "dodge channel is not finite");
+                    assert!((-1.0..=1.0).contains(value), "dodge channel out of range: {value}");
+                }
+            }
+            kf_duel_free(env);
+        }
     }
 }

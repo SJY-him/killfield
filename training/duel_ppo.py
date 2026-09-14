@@ -36,10 +36,16 @@ from torch.distributions import Categorical
 
 from duel_env import (
     ACTIONS,
+    AMMO_INDEX,
     OPPONENT_NAMES,
     BULLET_DIM,
     BULLET_OFFSET,
     BULLET_SLOTS,
+    DODGE_DIM,
+    DODGE_OFFSET,
+    ETA_INDEX,
+    HIT_INDEX,
+    IDLE_STREAK_INDEX,
     MAP_CHANNELS,
     MAP_DIM,
     MAP_H,
@@ -47,10 +53,11 @@ from duel_env import (
     OBS_DIM,
     OBS_SCHEMA_VERSION,
     SCALAR_DIM,
+    SUICIDE_INDEX,
     DuelVec,
 )
 
-ARCH = "duel_cnn_v1"
+ARCH = "duel_cnn_v2_gated"
 
 
 @dataclass(frozen=True)
@@ -78,16 +85,41 @@ class Config:
 
 class ActorCritic(nn.Module):
     """A small CNN over the maze, a shared encoder over the bullets, an MLP
-    over everything else.
+    over everything else, and three residual gates on top of the actor.
 
     The bullet rows arrive in engine creation order, which shifts as rounds are
     fired and expire. Feeding that to a dense layer would make the policy
     sensitive to storage order, so the rows go through one shared encoder and
     are pooled with a mask.
+
+    The gates are the part that is not obvious. Three quantities the engine has
+    already computed are wired to the logits directly rather than left for the
+    trunk to rediscover:
+
+      * `score::dodge_safety`'s per-movement survival outlook, added to each
+        movement's pair of logits;
+      * a fire bias built from ammo, the predicted-hit and predicted-suicide
+        flags, and the shot's time of flight;
+      * a penalty on the two fully-neutral actions that grows with the idle
+        streak.
+
+    The first two are scaled by `alpha_old + delta(features)`: a warm-started
+    constant the run inherits, plus a correction the trunk can steer per frame.
+    Passing `dodge_gate=False` / `ammo_gate=False` gives the older flat-scalar
+    form instead, which is what checkpoints before v17 were trained with.
+
+    None of this was published. It is reconstructed from what the browser
+    ships — see `training/hybrid_web.py` for how, and
+    `training/tests/test_hybrid_web.py` for the check that it reproduces the
+    deployed model's logits.
     """
 
-    def __init__(self):
+    def __init__(self, dodge_gate: bool = True, ammo_gate: bool = True,
+                 dodge_alpha_old: float = 0.0,
+                 ammo_alpha_old=(0.0, 0.0, 0.0, 0.0)):
         super().__init__()
+        self.dodge_gate = dodge_gate
+        self.ammo_gate = ammo_gate
         self.map = nn.Sequential(
             nn.Conv2d(MAP_CHANNELS, 16, 3, padding=1), nn.ReLU(),
             nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
@@ -101,12 +133,42 @@ class ActorCritic(nn.Module):
         self.trunk = nn.Sequential(nn.Linear(128 + 128 + 64, 256), nn.Tanh())
         self.actor = nn.Linear(256, ACTIONS)
         self.critic = nn.Linear(256, 1)
+        self.idle_logit_penalty = nn.Parameter(torch.zeros(()))
+
+        if dodge_gate:
+            self.dodge_alpha_old = nn.Parameter(torch.tensor(float(dodge_alpha_old)))
+            self.dodge_delta = nn.Sequential(
+                nn.Linear(256, 64), nn.Tanh(), nn.Linear(64, 1),
+            )
+        else:
+            self.dodge_scale = nn.Parameter(torch.zeros(()))
+        if ammo_gate:
+            self.ammo_alpha_old = nn.Parameter(
+                torch.tensor([float(v) for v in ammo_alpha_old])
+            )
+            self.ammo_delta = nn.Sequential(
+                nn.Linear(256, 64), nn.Tanh(), nn.Linear(64, 4),
+            )
+        else:
+            self.ammo_scale = nn.Parameter(torch.zeros(()))
+            self.shot_quality_scale = nn.Parameter(torch.zeros(()))
+            self.ammo_lock_scale = nn.Parameter(torch.zeros(()))
+            self.suicide_scale = nn.Parameter(torch.zeros(()))
+
         for layer in self.modules():
             if isinstance(layer, (nn.Linear, nn.Conv2d)):
                 nn.init.orthogonal_(layer.weight, gain=math.sqrt(2))
                 nn.init.zeros_(layer.bias)
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        # A gate has to start as the constant it was warm-started with, not as
+        # a random projection of the trunk: zero the correction's last layer so
+        # `alpha_old + delta(features)` is exactly `alpha_old` on step one.
+        for name in ("dodge_delta", "ammo_delta"):
+            head = getattr(self, name, None)
+            if head is not None:
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)
 
     def features(self, obs, mask):
         grid = obs[:, :MAP_DIM].reshape(-1, MAP_W, MAP_H, MAP_CHANNELS)
@@ -131,9 +193,68 @@ class ActorCritic(nn.Module):
             torch.cat((self.map(grid), self.scalars(scalars), mean, peak), dim=1)
         )
 
-    def forward(self, obs, mask):
+    def gate_scales(self, features):
+        """`(dodge, ammo, shot_quality, ammo_lock, suicide)` for this batch."""
+        batch = features.shape[0]
+        if self.dodge_gate:
+            dodge = self.dodge_alpha_old + self.dodge_delta(features).squeeze(-1)
+        else:
+            dodge = self.dodge_scale.expand(batch)
+        if self.ammo_gate:
+            ammo = self.ammo_alpha_old + self.ammo_delta(features)
+            return (dodge, *ammo.unbind(dim=1))
+        return (
+            dodge,
+            self.ammo_scale.expand(batch),
+            self.shot_quality_scale.expand(batch),
+            self.ammo_lock_scale.expand(batch),
+            self.suicide_scale.expand(batch),
+        )
+
+    def forward(self, obs, mask, dodge=None):
+        """`dodge` is accepted because the exporter passes it explicitly.
+
+        The trainer leaves it out. Those nine numbers already sit at
+        `DODGE_OFFSET` inside the observation, so slicing them here keeps every
+        training call site a two-argument one and removes any chance of the
+        policy being handed a dodge vector from a different frame than the
+        observation it goes with.
+        """
+        if dodge is None:
+            dodge = obs[:, DODGE_OFFSET:DODGE_OFFSET + DODGE_DIM]
         features = self.features(obs, mask)
-        return self.actor(features), self.critic(features).squeeze(-1)
+        logits = self.actor(features)
+        value = self.critic(features).squeeze(-1)
+
+        dodge_scale, ammo_scale, shot_quality, ammo_lock, suicide_scale = (
+            self.gate_scales(features)
+        )
+
+        ammo = obs[:, AMMO_INDEX]
+        hit = obs[:, HIT_INDEX]
+        suicide = obs[:, SUICIDE_INDEX]
+        eta = (obs[:, ETA_INDEX] * 3.0).clamp(0.0, 1.0)
+        hit_soon = hit * (1.0 - eta)
+        fire_bias = (
+            ammo_scale * ammo
+            + shot_quality * hit_soon
+            - ammo_lock * (1.0 - ammo) ** 2 * (1.0 - hit_soon)
+            - suicide_scale * suicide
+        )
+
+        # An action index is [movement, fire]: consecutive pairs share a
+        # movement, and the odd one of each pair is the one that shoots.
+        logits = logits + dodge_scale.unsqueeze(1) * dodge.repeat_interleave(2, dim=1)
+        fire = torch.zeros_like(logits)
+        fire[:, 1::2] = fire_bias.unsqueeze(1)
+        logits = logits + fire
+
+        idle = ((obs[:, IDLE_STREAK_INDEX] * 25.0 - 8.0) / 17.0).clamp(0.0, 1.0)
+        penalty = (idle * self.idle_logit_penalty).unsqueeze(1).expand(-1, 2)
+        logits = logits.index_add(
+            1, torch.tensor([8, 9], device=logits.device), -penalty,
+        )
+        return logits, value
 
 
 def tensors(env, device):
@@ -305,6 +426,13 @@ def main():
                         help="warm-start from a checkpoint's weights only. Use "
                              "when the reward changed: a stale Adam state and "
                              "value head should not carry over")
+    parser.add_argument("--init-from-web", type=Path, default=None,
+                        metavar="HYBRID_BIN",
+                        help="warm-start from the flat f32 export the browser "
+                             "loads (viewer/assets/hybrid.bin, with its .json "
+                             "beside it). The export carries no critic and no "
+                             "Adam state, so the value head starts fresh and "
+                             "the critic warmup earns its keep")
     parser.add_argument("--resume", type=Path, default=None,
                         help="continue a run: weights, Adam state and the "
                              "position in the learning-rate schedule")
@@ -346,8 +474,14 @@ def main():
     device = pick_device(model)
     model = model.to(device)
 
-    if args.init_from and args.resume:
-        raise SystemExit("--init-from and --resume mean different things; pick one")
+    starts = [bool(args.init_from), bool(args.init_from_web), bool(args.resume)]
+    if sum(starts) > 1:
+        raise SystemExit(
+            "--init-from, --init-from-web and --resume mean different things; pick one"
+        )
+    # Whether this run begins from a policy that already plays. It decides how
+    # protective the critic warmup has to be; see where it is used below.
+    warm_started = bool(args.init_from or args.init_from_web)
 
     resume_state = None
     if args.resume:
@@ -358,6 +492,17 @@ def main():
         payload = torch.load(args.init_from, map_location=device, weights_only=False)
         model.load_state_dict(payload["model"])
         print(f"warm start from {args.init_from}", flush=True)
+    elif args.init_from_web:
+        from hybrid_web import fill_from_export  # noqa: PLC0415
+
+        meta = fill_from_export(
+            model, args.init_from_web, args.init_from_web.with_suffix(".json"),
+            allow_missing=("critic",),
+        )
+        model = model.to(device)
+        print(f"warm start from the web export {args.init_from_web} "
+              f"({meta['checkpoint']}, schema {meta['schema']}) — "
+              "critic is fresh", flush=True)
 
     # The pool's frozen slots. Kept in eval mode and never updated: it is a
     # fixed rung to climb, not a moving target, so a rising win rate against it
@@ -545,6 +690,21 @@ def main():
                             - entropy_coefficient * entropy)
                 optimiser.zero_grad(set_to_none=True)
                 loss.backward()
+                if critic_only and warm_started:
+                    # The value loss reaches the critic head through the shared
+                    # trunk, so an unrestricted warmup step trains the whole
+                    # representation — which is fine from scratch, where none
+                    # of it means anything yet, and destructive from a trained
+                    # policy, where twenty updates of value gradients reshape
+                    # the features the actor depends on before PPO's clipping
+                    # is there to hold it down. Measured on a v17b warm start:
+                    # the first update alone moved the policy by KL 0.073 with
+                    # 19% of its ratios already clipped. Drop everything but
+                    # the head so the critic catches up to the policy instead
+                    # of dragging it along.
+                    for name, parameter in model.named_parameters():
+                        if not name.startswith("critic.") and parameter.grad is not None:
+                            parameter.grad = None
                 nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                 optimiser.step()
 
