@@ -11,6 +11,71 @@
  */
 
 export const NEUTRAL_ACTION = 8; // stationary, no fire
+/** The other half of the pair: same stationary movement, trigger pulled. */
+export const NEUTRAL_ACTION_FIRING = 9;
+
+/**
+ * How long a seat may hold perfectly still before this forces it to move.
+ *
+ * The policy has its own brake — `idle_logit_penalty`, subtracted from both
+ * neutral logits and scaled by the idle streak the observation carries — and
+ * it is not broken. It is bounded. `IDLE_STREAK_CAP_FRAMES` is 25, so the
+ * pressure saturates after one second and never grows again; a deadlock that
+ * survives its first 25 frames survives forever.
+ *
+ * Measured on the deployed checkpoint, in stalls caught during self-play: the
+ * streak reads its cap, the penalty applies in full at 4.06, and the neutral
+ * logit still leads the best alternative by between 1.0 and 5.8. The brake
+ * works and is simply outvoted.
+ *
+ * Two seconds is far past anything ordinary play produces — the same policy
+ * never stands still this long outside a stall — so this only ever fires on
+ * the pathology it is here for.
+ */
+export const STILLNESS_LIMIT_FRAMES = 50;
+
+/**
+ * Keeps one seat from standing still forever.
+ *
+ * Deliberately a runtime guard rather than a change to the policy: it makes no
+ * claim about what the seat *should* do, only that "nothing, indefinitely" is
+ * not an option. The escape is the best action that actually moves the hull,
+ * so the seat resumes from its own preference rather than from a random jolt.
+ */
+export class StillnessGuard {
+  constructor(limit = STILLNESS_LIMIT_FRAMES) {
+    this.limit = limit;
+    this.streak = 0;
+  }
+
+  /** Call when the round changes; a fresh arena is not a continued stall. */
+  reset() {
+    this.streak = 0;
+  }
+
+  /**
+   * @param {number} action the policy's own choice
+   * @param {Float32Array|null} logits its scores, or null when unavailable
+   * @returns {number} the action to actually play
+   */
+  choose(action, logits) {
+    const still = action === NEUTRAL_ACTION || action === NEUTRAL_ACTION_FIRING;
+    if (!still) {
+      this.streak = 0;
+      return action;
+    }
+    this.streak += 1;
+    if (this.streak <= this.limit || logits === null) return action;
+    // Its own ranking, with the two standing-still actions struck out.
+    let best = -1;
+    for (let i = 0; i < logits.length; i += 1) {
+      if (i === NEUTRAL_ACTION || i === NEUTRAL_ACTION_FIRING) continue;
+      if (best < 0 || logits[i] > logits[best]) best = i;
+    }
+    this.streak = 0;
+    return best < 0 ? action : best;
+  }
+}
 /**
  * Ranked play is the default match with no handicap granted to the opponent.
  *
@@ -84,6 +149,7 @@ export class OpponentDriver {
     this.policy = policy;
     this.queue = [];
     this.pause = this.openingDelayFrames;
+    this.stillness = new StillnessGuard();
   }
 
   /** Wire the engine-side opponent up on a fresh handle. */
@@ -107,13 +173,15 @@ export class OpponentDriver {
    */
   decide(wasm, handle) {
     if (this.opponent !== "hybrid") return null;
+    // An opening pause is a rule of the match, not a stall, so it must not
+    // feed the guard.
     if (this.pause > 0) return { action: NEUTRAL_ACTION, logits: null };
 
     const { observation, mask, dodge } = readObservation(wasm, handle, OPPONENT_SEAT);
     const logits = this.policy.logits(observation, mask, dodge);
     let best = 0;
     for (let i = 1; i < logits.length; i += 1) if (logits[i] > logits[best]) best = i;
-    this.queue.push({ action: best, logits });
+    this.queue.push({ action: this.stillness.choose(best, logits), logits });
 
     // Until the queue is deep enough the seat actuates nothing, which is what
     // the delay handicap means: it plans every frame but acts late.
@@ -132,6 +200,7 @@ export class OpponentDriver {
     if (newRound) {
       this.queue.length = 0;
       this.pause = this.openingDelayFrames;
+      this.stillness.reset();
       if (this.opponent === "killfield") {
         wasm.kf_set_mpc_enabled(handle, OPPONENT_SEAT, this.pause === 0 ? 1 : 0);
       }

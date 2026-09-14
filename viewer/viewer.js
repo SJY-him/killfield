@@ -24,14 +24,14 @@
  *     ray count (512, always) are not user-facing.
  */
 
-import * as C from "./src/constants.js?v=a85417b0";
-import { STRINGS, loadLang, saveLang } from "./src/i18n.js?v=a85417b0";
-import { Keyboard, TouchControls } from "./src/input.js?v=a85417b0";
-import { AIM_MODE_AIM, AIM_MODE_DRIVE, AIM_MODE_OFF, MouseAim } from "./src/mouse-aim.js?v=a85417b0";
-import { SoundEffects } from "./src/audio.js?v=a85417b0";
-import { Rng } from "./src/rng.js?v=a85417b0";
-import { interpolatePredictedPose, simulationBudget } from "./src/low-latency.js?v=a85417b0";
-import { HybridPolicy } from "./src/hybrid.js?v=a85417b0";
+import * as C from "./src/constants.js?v=e978b055";
+import { STRINGS, loadLang, saveLang } from "./src/i18n.js?v=e978b055";
+import { Keyboard, TouchControls } from "./src/input.js?v=e978b055";
+import { AIM_MODE_AIM, AIM_MODE_DRIVE, AIM_MODE_OFF, MouseAim } from "./src/mouse-aim.js?v=e978b055";
+import { SoundEffects } from "./src/audio.js?v=e978b055";
+import { Rng } from "./src/rng.js?v=e978b055";
+import { interpolatePredictedPose, simulationBudget } from "./src/low-latency.js?v=e978b055";
+import { HybridPolicy } from "./src/hybrid.js?v=e978b055";
 /** Play mode always seats the human in tank 1. */
 const HUMAN_SEAT = 1;
 // engine/src/duel_obs.rs: the Hybrid observation is schema 24, 1028 semantic
@@ -40,11 +40,12 @@ import {
   HYBRID_BULLET_SLOTS,
   HYBRID_OBS_DIM,
   HYBRID_OBS_SCHEMA,
+  StillnessGuard,
   KILLFIELD_RAYS,
   OpponentDriver,
   policyActionToInput,
   readObservation,
-} from "./src/opponent.js?v=a85417b0";
+} from "./src/opponent.js?v=e978b055";
 
 const STEP_MS = 1000 / C.FPS; // 40 ms
 const MAX_CATCHUP_MS = 250;
@@ -871,6 +872,8 @@ let previousRenderState = null;
 let seatController = ["hybrid", "laika"];
 /** Seats a Hybrid policy must drive this tick — see driveHybridSeats(). */
 let hybridSeats = [];
+/** One per seat, because a stall is a property of a tank rather than a match. */
+const stillnessGuards = [new StillnessGuard(), new StillnessGuard()];
 /** Play mode's opponent state machine: the actuation delay queue and the
  *  opening pause (src/opponent.js). Null in Watch mode, which has neither. */
 let opponentDriver = null;
@@ -984,6 +987,7 @@ function newGame() {
   syncTeamColors();
 
   roundFrames = 0;
+  stillnessGuards.forEach((guard) => guard.reset());
   previousRenderState = captureRenderState(renderBuffer());
   const buf = renderBuffer();
   currentRound = buf[9];
@@ -1111,7 +1115,13 @@ function driveHybridSeats() {
   }
   for (const seat of hybridSeats) {
     const { observation, mask, dodge } = readObservation(wasm, handle, seat);
-    wasm.kf_set_hybrid_action(handle, seat, hybridPolicy.act(observation, mask, dodge));
+    // Watch mode runs the same policy in both chairs, so a symmetric position
+    // produces mirrored choices and the two can agree to stand still for the
+    // rest of the round. Each seat gets its own guard; see StillnessGuard.
+    const logits = hybridPolicy.logits(observation, mask, dodge);
+    let best = 0;
+    for (let i = 1; i < logits.length; i += 1) if (logits[i] > logits[best]) best = i;
+    wasm.kf_set_hybrid_action(handle, seat, stillnessGuards[seat].choose(best, logits));
   }
   return null;
 }
@@ -1168,7 +1178,11 @@ function tick() {
   const buf = renderBuffer();
   currentRound = buf[9];
   frozen = buf[14] > 0.5;
-  if (flags & 1) { roundFrames = 0; applyForcedWeapon(); } // new_round
+  if (flags & 1) { // new_round
+    roundFrames = 0;
+    applyForcedWeapon();
+    stillnessGuards.forEach((guard) => guard.reset());
+  }
   if (flags & 64) applyRoundEnd(buf[15]); // round_end
   // The policy pilot drives the human seat at 25x to self-test; ?target=N
   // stops it once it has taken N rounds in a row.
