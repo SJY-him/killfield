@@ -3,8 +3,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="killfield-submit-endpoint" content="https://killfield-leaderboard-submit.2665318958.workers.dev/submit">
-<meta name="killfield-turnstile-sitekey" content="0x4AAAAAAEx3XzNil8HxSk6H">
 <meta name="theme-color" content="#f7f7f5">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -30,15 +28,11 @@
 <link rel="icon" type="image/svg+xml" sizes="any" href="assets/brand/hybrid.svg">
 <link rel="apple-touch-icon" sizes="180x180" href="assets/brand/hybrid-180.png">
 <link rel="manifest" href="manifest.webmanifest?v=hybrid-1">
-<link rel="stylesheet" href="style.css?v=network-submit">
+<link rel="stylesheet" href="style.css?v=a8a71fab">
 </head>
 <body>
 <main>
   <header>
-    <a id="ranked-board" class="board-link" href="leaderboard.html">
-      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M2 13.2h12M4.2 13V7.4M8 13V3.2M11.8 13v-3.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-      <span id="ranked-board-label">Leaderboard</span>
-    </a>
     <button id="lang-toggle" type="button" class="quiet" aria-label="Switch to Chinese">中文</button>
   </header>
 
@@ -117,6 +111,8 @@
       <select id="play-opponent" class="native-controller-select" tabindex="-1" aria-hidden="true"><option value="laika">Laika</option><option value="hybrid" selected>Hybrid</option><option value="killfield">Killfield</option></select>
     </div>
     <button id="instant-turn" type="button" aria-pressed="false" class="toggle">No turn-rate limit: off</button>
+    <button id="mouse-aim" type="button" aria-pressed="false" class="toggle">Mouse: off</button>
+    <button id="pickups" type="button" aria-pressed="false" class="toggle">Weapon crates: off</button>
     <label class="range-field"><span id="forward-alignment-label">Wheel forward region</span><input id="forward-alignment" type="range" min="0" max="360" step="2.8125" value="360"><output id="forward-alignment-value" for="forward-alignment">360° / 360°</output></label>
     <div class="controller-picker" id="reaction-delay-field" data-theme-picker data-select-id="reaction-delay" data-label-id="reaction-delay-label">
       <span id="reaction-delay-label">Opponent delay</span>
@@ -130,30 +126,6 @@
       <select id="reaction-delay" class="native-controller-select" tabindex="-1" aria-hidden="true"><option value="0">0 frames</option><option value="1">1 frame</option><option value="2">2 frames</option><option value="3">3 frames</option></select>
     </div>
     <label class="range-field" id="opening-delay-field"><span id="opening-delay-label">Opening pause</span><input id="opening-delay" type="range" min="0" max="3" step="0.1" value="0.5"><output id="opening-delay-value" for="opening-delay">0.5 s</output></label>
-  </section>
-
-  <section class="ranked" id="ranked-row" hidden aria-label="Ranked run">
-    <div class="ranked-head">
-      <div class="ranked-figure">
-        <strong class="ranked-score" id="ranked-score">0</strong>
-        <span class="ranked-unit" id="ranked-unit">best shutout</span>
-      </div>
-      <p class="ranked-status" id="ranked-status" role="status"></p>
-      <button id="ranked-start" type="button" class="toggle ranked-toggle">Ranked run</button>
-    </div>
-    <div class="ranked-submit" id="ranked-submit" hidden>
-      <label class="ranked-field">
-        <span id="ranked-name-label">Your name</span>
-        <input id="ranked-name" type="text" maxlength="24" autocomplete="off" spellcheck="false" required placeholder="Your name" aria-labelledby="ranked-name-label">
-      </label>
-      <label class="ranked-field">
-        <span id="ranked-github-label">GitHub (optional)</span>
-        <input id="ranked-github" type="text" maxlength="39" autocomplete="off" spellcheck="false" placeholder="GitHub (optional)" aria-labelledby="ranked-github-label">
-      </label>
-      <button id="ranked-upload" type="button" class="solid-btn">Submit</button>
-      <button id="ranked-github-fallback" type="button" class="ghost-btn" hidden>Submit with GitHub</button>
-      <div id="ranked-turnstile" class="ranked-turnstile"></div>
-    </div>
   </section>
 
   <div class="actions">
@@ -174,9 +146,8 @@
       </div>
     </div>
   </div>
-  <footer class="site-footer"><a href="https://github.com/Cichlider/killfield" target="_blank" rel="noreferrer">github.com/Cichlider/killfield</a><span>© 2026 Cichlider. All rights reserved.</span></footer>
+  <footer class="site-footer"><a href="https://github.com/Cichlider/killfield" target="_blank" rel="noreferrer">基于此项目二创</a></footer>
 </main>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
-<script type="module" src="viewer.js?v=v17b-leaderboard-9"></script>
+<script type="module" src="viewer.js?v=0d71a74f"></script>
 </body>
 </html>

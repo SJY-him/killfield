@@ -24,53 +24,51 @@
  *     ray count (512, always) are not user-facing.
  */
 
-import * as C from "./src/constants.js";
-import { STRINGS, loadLang, saveLang } from "./src/i18n.js?v=github-fallback";
-import { Keyboard, TouchControls } from "./src/input.js?v=wheel-360";
-import { SoundEffects } from "./src/audio.js";
-import { Rng } from "./src/rng.js";
-import { interpolatePredictedPose, simulationBudget } from "./src/low-latency.js";
-import { HybridPolicy } from "./src/hybrid.js?v=4be8a6e2";
-import {
-  HUMAN_SEAT, LIMITS, MIN_SUBMITTABLE_SHUTOUT, longestShutout,
-} from "./src/replay.js?v=two-win-floor";
+import * as C from "./src/constants.js?v=36d17ebd";
+import { STRINGS, loadLang, saveLang } from "./src/i18n.js?v=36d17ebd";
+import { Keyboard, TouchControls } from "./src/input.js?v=36d17ebd";
+import { AIM_MODE_AIM, AIM_MODE_DRIVE, AIM_MODE_OFF, MouseAim } from "./src/mouse-aim.js?v=36d17ebd";
+import { SoundEffects } from "./src/audio.js?v=36d17ebd";
+import { Rng } from "./src/rng.js?v=36d17ebd";
+import { interpolatePredictedPose, simulationBudget } from "./src/low-latency.js?v=36d17ebd";
+import { HybridPolicy } from "./src/hybrid.js?v=36d17ebd";
+/** Play mode always seats the human in tank 1. */
+const HUMAN_SEAT = 1;
 // engine/src/duel_obs.rs: the Hybrid observation is schema 24, 1028 semantic
-// floats then 10 bullet-mask floats. These live in src/ranked.js because the
-// leaderboard verifier reads the same layout out of the same wasm memory.
+// floats then 10 bullet-mask floats.
 import {
   HYBRID_BULLET_SLOTS,
   HYBRID_OBS_DIM,
   KILLFIELD_RAYS,
   OpponentDriver,
-  RANKED_DELAY_FRAMES,
-  RANKED_OPENING_DELAY_SECONDS,
-  SessionRecorder,
   policyActionToInput,
   readObservation,
-} from "./src/ranked.js?v=policy-pilot";
-import {
-  buildStamps, buildSubmission, openSubmissionIssue, submitToGateway,
-} from "./src/submit.js?v=github-fallback";
+} from "./src/opponent.js?v=36d17ebd";
 
 const STEP_MS = 1000 / C.FPS; // 40 ms
 const MAX_CATCHUP_MS = 250;
 const STREAK_STORAGE_KEY = "killfield-streak";
 const INSTANT_TURN_STORAGE_KEY = "killfield-human-instant-turn-v2";
+const MOUSE_AIM_STORAGE_KEY = "killfield-human-mouse-mode-v2";
+/** Cycle order for the one button that carries all three states. */
+const MOUSE_MODES = [AIM_MODE_OFF, AIM_MODE_AIM, AIM_MODE_DRIVE];
+const PICKUPS_STORAGE_KEY = "killfield-weapon-crates";
 const OPENING_DELAY_STORAGE_KEY = "killfield-opening-delay-seconds";
 const REACTION_DELAY_STORAGE_KEY = "killfield-reaction-delay-frames";
-const RANKED_NAME_STORAGE_KEY = "killfield-ranked-name";
-const RANKED_GITHUB_STORAGE_KEY = "killfield-ranked-github";
 const DEFAULT_OPENING_DELAY_SECONDS = 0.5;
-const SUBMIT_ENDPOINT = document.querySelector('meta[name="killfield-submit-endpoint"]')?.content ?? "";
-const TURNSTILE_SITEKEY = document.querySelector('meta[name="killfield-turnstile-sitekey"]')?.content ?? "";
 // Owner/testing aid: the public policy can drive the human input path without
 // bypassing recording or verification. It is opt-in and has no visible toggle.
 const QUERY = new URLSearchParams(location.search);
 const POLICY_PILOT = QUERY.get("pilot") === "policy";
+/** `?weapon=laser` (or gatling/shotgun/shield) hands the human that weapon at
+ *  the start of every round, so a weapon can be tried without waiting on a
+ *  random crate. Same debug-hook convention as `?pilot=policy`. */
+const FORCED_WEAPONS = { gatling: 1, shotgun: 2, shield: 3, laser: 4 };
+const FORCED_WEAPON = FORCED_WEAPONS[QUERY.get("weapon")] ?? null;
 const requestedPilotTarget = Number(QUERY.get("target"));
 const POLICY_PILOT_TARGET = Number.isInteger(requestedPilotTarget)
-  ? Math.min(20, Math.max(MIN_SUBMITTABLE_SHUTOUT, requestedPilotTarget))
-  : MIN_SUBMITTABLE_SHUTOUT;
+  ? Math.min(20, Math.max(2, requestedPilotTarget))
+  : 2;
 const requestedPilotSeed = Number(QUERY.get("seed"));
 const POLICY_PILOT_SEED = Number.isInteger(requestedPilotSeed)
   && requestedPilotSeed >= 0 && requestedPilotSeed <= 0xffffffff
@@ -80,7 +78,9 @@ const POLICY_PILOT_STEPS_PER_FRAME = 64;
 // Render buffer layout, matching engine/src/wasm.rs's build_render() doc
 // comment: 18 header slots, then 120 paint flags (unused here — killfield has
 // no paint mechanic), then wall_count*4, tank_count*6, bullet_count*2.
-const HEADER_SLOTS = 18;
+const HEADER_SLOTS = 21;   // engine/src/wasm.rs; [18..20] pickups + laser
+const TANK_SLOTS = 8;      // x, y, rotation, alive, number, scale, weapon, shield
+const PICKUP_SLOTS = 3;    // x, y, weapon
 const PAINT_SLOTS = 12 * 10;
 const HEADER = HEADER_SLOTS + PAINT_SLOTS;
 
@@ -90,6 +90,12 @@ const THEME = {
   wall: "#3F4550",
   bullet: "#101214",
   outline: "#08090B",
+  // The beam: a near-white core inside a saturated halo, so it reads as light
+  // rather than as another wall stroke.
+  laserCore: "#FFF4E8",
+  // The unfired aiming line, deliberately cooler than a live beam.
+  laserAim: "#C2472E",
+  laserHalo: "#FF3B30",
 };
 // Exactly two colours, by role rather than by tank index — a seat can be any
 // controller in Watch mode, so "tank 0 is always killfield" no longer holds.
@@ -127,6 +133,8 @@ const swatches = [0, 1].map((i) => document.getElementById(`swatch-${i}`));
 const rerollButton = document.getElementById("reroll");
 const resetScoreButton = document.getElementById("reset-score");
 const instantTurnButton = document.getElementById("instant-turn");
+const mouseAimButton = document.getElementById("mouse-aim");
+const pickupsButton = document.getElementById("pickups");
 const forwardAlignmentInput = document.getElementById("forward-alignment");
 const forwardAlignmentLabel = document.getElementById("forward-alignment-label");
 const forwardAlignmentValue = document.getElementById("forward-alignment-value");
@@ -162,20 +170,6 @@ const pauseButton = document.getElementById("pause");
 const soundButton = document.getElementById("sound");
 const fullscreenButton = document.getElementById("fullscreen");
 const langToggle = document.getElementById("lang-toggle");
-const rankedRow = document.getElementById("ranked-row");
-const rankedStartButton = document.getElementById("ranked-start");
-const rankedStatus = document.getElementById("ranked-status");
-const rankedSubmit = document.getElementById("ranked-submit");
-const rankedNameLabel = document.getElementById("ranked-name-label");
-const rankedNameInput = document.getElementById("ranked-name");
-const rankedGithubLabel = document.getElementById("ranked-github-label");
-const rankedGithubInput = document.getElementById("ranked-github");
-const rankedUploadButton = document.getElementById("ranked-upload");
-const rankedGithubFallbackButton = document.getElementById("ranked-github-fallback");
-const rankedBoardLabel = document.getElementById("ranked-board-label");
-const rankedTurnstile = document.getElementById("ranked-turnstile");
-const rankedScore = document.getElementById("ranked-score");
-const rankedUnit = document.getElementById("ranked-unit");
 const touchControlsRoot = document.getElementById("touch-controls");
 const touchVisibilityButton = document.getElementById("touch-visibility");
 const orientationHint = document.getElementById("orientation-hint");
@@ -184,9 +178,11 @@ const orientationBody = document.getElementById("orientation-body");
 
 const keyboard = new Keyboard();
 const touchControls = new TouchControls(touchControlsRoot, touchVisibilityButton);
+const mouseAim = new MouseAim(canvas);
 const sounds = new SoundEffects();
 let keyboardFirePressed = false;
 let touchFirePressed = false;
+let mouseFirePressed = false;
 let immediateFirePressed = false;
 
 let wasm = null;
@@ -284,11 +280,11 @@ function captureRenderState(buf) {
   const nTanks = buf[6] | 0;
   const nBullets = buf[7] | 0;
   const tankBase = HEADER + nWalls * 4;
-  const bulletBase = tankBase + nTanks * 6;
+  const bulletBase = tankBase + nTanks * TANK_SLOTS;
   return {
     round: buf[9],
     tanks: Array.from({ length: nTanks }, (_, i) => {
-      const o = tankBase + i * 6;
+      const o = tankBase + i * TANK_SLOTS;
       return { x: buf[o], y: buf[o + 1], rotation: buf[o + 2] };
     }),
     bullets: Array.from({ length: nBullets }, (_, i) => ({
@@ -361,7 +357,147 @@ function drawTank(ctx, x, y, rotation, s, colors) {
   ctx.stroke();
 }
 
-function draw(buf, colors, previous, alpha, localPlayer = null) {
+/** Weapon codes from engine/src/pickups.rs's `Weapon::code`. */
+const WEAPON_NONE = 0;
+const WEAPON_GATLING = 1;
+const WEAPON_SHOTGUN = 2;
+const WEAPON_SHIELD = 3;
+const WEAPON_LASER = 4;
+
+/**
+ * The aiming line for a loaded laser: the exact path `laser::trace` says the
+ * shot would take, bounces included. Dashed and thin so it never competes with
+ * a beam that was actually fired, and it goes solid-bright the moment the path
+ * ends on a tank — that flip is the whole aiming signal.
+ */
+function drawLaserPreview(ctx, preview, ox, oy, scale) {
+  if (!preview || preview.points.length < 2) return;
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  // Tuned by eye against the light floor: the first pass was a 1px line at
+  // 0.4 alpha and was effectively invisible, which defeats the whole point.
+  ctx.setLineDash(preview.wouldHit ? [] : [scale * 0.2, scale * 0.14]);
+  ctx.strokeStyle = preview.wouldHit ? THEME.laserHalo : THEME.laserAim;
+  ctx.globalAlpha = preview.wouldHit ? 0.95 : 0.62;
+  ctx.lineWidth = Math.max(1.6, scale * (preview.wouldHit ? 0.075 : 0.05));
+  ctx.beginPath();
+  ctx.moveTo(ox + preview.points[0].x, oy + preview.points[0].y);
+  for (let i = 1; i < preview.points.length; i += 1) {
+    ctx.lineTo(ox + preview.points[i].x, oy + preview.points[i].y);
+  }
+  ctx.stroke();
+  // A ring on the end point: where the shot stops, whether that is a hull, a
+  // wall, or the end of its range.
+  const last = preview.points[preview.points.length - 1];
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.arc(ox + last.x, oy + last.y, scale * (preview.wouldHit ? 0.15 : 0.09), 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * The laser's afterglow: the polyline the beam actually travelled, drawn as a
+ * hot core inside a wider halo, fading over `LASER_BEAM_FRAMES`. The engine
+ * hands over an alpha rather than a frame count, so the fade lives in one place.
+ */
+function drawBeam(ctx, buf, base, pointCount, alpha, ox, oy, scale) {
+  if (pointCount < 2 || !(alpha > 0)) return;
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  const trace = () => {
+    ctx.beginPath();
+    ctx.moveTo(ox + buf[base], oy + buf[base + 1]);
+    for (let i = 1; i < pointCount; i += 1) {
+      ctx.lineTo(ox + buf[base + i * 2], oy + buf[base + i * 2 + 1]);
+    }
+    ctx.stroke();
+  };
+  ctx.globalAlpha = alpha * 0.3;
+  ctx.strokeStyle = THEME.laserHalo;
+  ctx.lineWidth = Math.max(3, scale * 0.16);
+  trace();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = THEME.laserCore;
+  ctx.lineWidth = Math.max(1.2, scale * 0.045);
+  trace();
+  ctx.restore();
+}
+
+/**
+ * A crate on the floor. The glyph inside says which weapon without needing a
+ * legend: three bars for the gatling's rate of fire, a fan for the shotgun's
+ * spread, an arc for the shield, a bolt for the laser.
+ */
+function drawPickup(ctx, x, y, weapon, scale) {
+  const r = scale * 0.21;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.lineWidth = Math.max(1.5, scale * 0.035);
+  ctx.fillStyle = THEME.page;
+  ctx.strokeStyle = THEME.outline;
+  ctx.beginPath();
+  ctx.rect(-r, -r, r * 2, r * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.lineWidth = Math.max(1.2, scale * 0.028);
+  ctx.beginPath();
+  if (weapon === WEAPON_GATLING) {
+    for (let i = -1; i <= 1; i += 1) {
+      ctx.moveTo(-r * 0.45, i * r * 0.38);
+      ctx.lineTo(r * 0.45, i * r * 0.38);
+    }
+  } else if (weapon === WEAPON_SHOTGUN) {
+    for (let i = -1; i <= 1; i += 1) {
+      ctx.moveTo(0, r * 0.5);
+      ctx.lineTo(i * r * 0.5, -r * 0.5);
+    }
+  } else if (weapon === WEAPON_SHIELD) {
+    ctx.arc(0, r * 0.25, r * 0.5, Math.PI, 0);
+    ctx.moveTo(-r * 0.5, r * 0.25);
+    ctx.lineTo(r * 0.5, r * 0.25);
+  } else if (weapon === WEAPON_LASER) {
+    // A bolt: one stroke with a kink, reading as a beam turning a corner.
+    ctx.moveTo(-r * 0.55, r * 0.45);
+    ctx.lineTo(r * 0.1, -r * 0.1);
+    ctx.lineTo(r * 0.55, r * 0.2);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** What a tank is carrying: a ring for the shield, pips for the loaded gun. */
+function drawLoadout(ctx, x, y, weapon, shield, scale, color) {
+  if (shield) {
+    ctx.save();
+    ctx.strokeStyle = color.turret;
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = Math.max(1.5, scale * 0.035);
+    ctx.beginPath();
+    ctx.arc(x, y, scale * 0.33, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  if (weapon === WEAPON_NONE) return;
+  ctx.save();
+  ctx.fillStyle = color.turret;
+  ctx.strokeStyle = THEME.page;
+  ctx.lineWidth = 1;
+  const pips = weapon === WEAPON_GATLING ? 3 : 2;
+  const step = scale * 0.09;
+  for (let i = 0; i < pips; i += 1) {
+    ctx.beginPath();
+    ctx.arc(x + (i - (pips - 1) / 2) * step, y - scale * 0.36, scale * 0.035, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function draw(buf, colors, previous, alpha, localPlayer = null, aimOverlay = null,
+  laserPreview = null) {
   renderer.syncSize();
   const ctx = renderer.ctx;
   const w = buf[0];
@@ -408,8 +544,9 @@ function draw(buf, colors, previous, alpha, localPlayer = null) {
   ctx.stroke();
 
   const tankBase = p;
-  p += nTanks * 6;
+  p += nTanks * TANK_SLOTS;
   const bulletBase = p;
+  const pickupBase = bulletBase + nBullets * 2;
   const sameRound = previous && previous.round === buf[9];
 
   ctx.fillStyle = THEME.bullet;
@@ -437,8 +574,21 @@ function draw(buf, colors, previous, alpha, localPlayer = null) {
     ctx.fill();
   }
 
+  drawLaserPreview(ctx, laserPreview, ox, oy, scale);
+
+  // The laser sits above the floor but below the hulls, so a beam that ends
+  // in a tank reads as stopping at it rather than crossing it.
+  drawBeam(ctx, buf, pickupBase + (buf[18] | 0) * PICKUP_SLOTS, buf[19] | 0, buf[20], ox, oy, scale);
+
+  // Crates go under the tanks: driving onto one should read as covering it.
+  const nPickups = buf[18] | 0;
+  for (let i = 0; i < nPickups; i++) {
+    const p = pickupBase + i * PICKUP_SLOTS;
+    drawPickup(ctx, ox + buf[p], oy + buf[p + 1], buf[p + 2] | 0, scale);
+  }
+
   for (let i = 0; i < nTanks; i++) {
-    const o = tankBase + i * 6;
+    const o = tankBase + i * TANK_SLOTS;
     if (buf[o + 3] < 0.5) continue;
     const predicted = localPlayer?.tank === i ? localPlayer.pose : null;
     const old = !predicted && sameRound ? previous.tanks[i] : null;
@@ -448,7 +598,84 @@ function draw(buf, colors, previous, alpha, localPlayer = null) {
       ?? (old ? interpolateAngle(old.rotation, buf[o + 2], alpha) : buf[o + 2]);
     const number = buf[o + 4] | 0;
     drawTank(ctx, ox + x, oy + y, rotation, buf[o + 5], colors[number % colors.length]);
+    drawLoadout(ctx, ox + x, oy + y, buf[o + 6] | 0, buf[o + 7] > 0.5, scale,
+      colors[number % colors.length]);
   }
+
+  if (aimOverlay !== null) {
+    ctx.save();
+    ctx.strokeStyle = THEME.outline;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(ox + aimOverlay.from.x, oy + aimOverlay.from.y);
+    ctx.lineTo(ox + aimOverlay.to.x, oy + aimOverlay.to.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.arc(ox + aimOverlay.to.x, oy + aimOverlay.to.y, 5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/**
+ * Invert `draw`'s placement to read the cursor in world coordinates, then
+ * offset it from the hull. Shake is deliberately left out of the inverse: the
+ * maze jitters for a few frames after a kill, and aim must not jitter with it.
+ */
+function cursorAimOffset(tankPose) {
+  if (!mouseAim.active() || !tankPose) return null;
+  if (wasm === null || handle === null) return null;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const buf = renderBuffer();
+  const ox = 10 + Math.max(0, (renderer.width - 20 - buf[0] * buf[2]) / 2);
+  const oy = 10;
+  const lx = (mouseAim.client.x - rect.left) / rect.width * renderer.width;
+  const ly = (mouseAim.client.y - rect.top) / rect.height * renderer.height;
+  return { x: lx - ox - tankPose.x, y: ly - oy - tankPose.y };
+}
+
+/** The dashed line and reticle that make an absolute heading readable. */
+function aimOverlayFor(localPlayer) {
+  const human = MODES[mode].humanTank;
+  if (human === null) return null;
+  const from = localPlayer?.tank === human
+    ? localPlayer.pose
+    : (previousRenderState?.tanks[human] ?? null);
+  const offset = cursorAimOffset(from);
+  if (offset === null) return null;
+  return { from, to: { x: from.x + offset.x, y: from.y + offset.y } };
+}
+
+/**
+ * Where your laser would land if you fired right now.
+ *
+ * An instant bouncing beam is unaimable without this: by the time you can see
+ * the shot it has already resolved. The engine walks the same `laser::trace`
+ * the shot itself uses, from the hull angle being *drawn* this frame rather
+ * than the authoritative one, so the line stays welded to the barrel while the
+ * hull is still turning. It mutates nothing.
+ */
+function laserPreviewFor(localPlayer, buf) {
+  const human = MODES[mode].humanTank;
+  if (human === null || wasm === null || handle === null) return null;
+  const base = HEADER + (buf[5] | 0) * 4 + human * TANK_SLOTS;
+  if (buf[base + 3] < 0.5 || (buf[base + 6] | 0) !== WEAPON_LASER) return null;
+  const rotation = localPlayer?.tank === human
+    ? localPlayer.pose.rotation
+    : buf[base + 2];
+  const count = wasm.kf_laser_preview(handle, human, rotation);
+  if (count < 2) return null;
+  const out = new Float32Array(
+    wasm.memory.buffer, wasm.kf_laser_preview_ptr(), 2 + count * 2,
+  );
+  const points = [];
+  for (let i = 0; i < count; i += 1) points.push({ x: out[2 + i * 2], y: out[2 + i * 2 + 1] });
+  return { points, wouldHit: out[0] > 0.5 };
 }
 
 // ------------------------------------------------------------------ sound
@@ -592,6 +819,8 @@ function applyLanguage() {
   rerollButton.textContent = s.reroll;
   resetScoreButton.textContent = s.resetScore;
   syncInstantTurnButton();
+  syncMouseAimButton();
+  syncPickupsButton();
   syncForwardAlignmentControl();
   syncReactionDelayControl();
   syncOpeningDelayControl();
@@ -621,6 +850,16 @@ try {
   const savedInstantTurn = localStorage.getItem(INSTANT_TURN_STORAGE_KEY);
   instantTurn = savedInstantTurn === null ? true : savedInstantTurn === "1";
 } catch { /* Default stays on when browser storage is unavailable. */ }
+let pickupsEnabled = false;
+try {
+  pickupsEnabled = localStorage.getItem(PICKUPS_STORAGE_KEY) === "1";
+} catch { /* Off by default when browser storage is unavailable. */ }
+let mouseMode = AIM_MODE_OFF;
+try {
+  const saved = localStorage.getItem(MOUSE_AIM_STORAGE_KEY);
+  if (MOUSE_MODES.includes(saved)) mouseMode = saved;
+} catch { /* Off by default when browser storage is unavailable. */ }
+mouseAim.setMode(mouseMode);
 let handle = null;
 let paused = false;
 let currentRound = 1;
@@ -632,23 +871,8 @@ let seatController = ["hybrid", "laika"];
 /** Seats a Hybrid policy must drive this tick — see driveHybridSeats(). */
 let hybridSeats = [];
 /** Play mode's opponent state machine: the actuation delay queue and the
- *  opening pause, in the same implementation the leaderboard verifier replays
- *  with (src/ranked.js). Null in Watch mode, which has neither. */
+ *  opening pause (src/opponent.js). Null in Watch mode, which has neither. */
 let opponentDriver = null;
-
-/** The ranked session being recorded, and the finished one awaiting upload.
- *  Recording is only ever armed from the ranked button, and any change to the
- *  match — a reroll, a new opponent, a different delay — closes it. */
-let ranked = null;
-let rankedResult = null;
-let rankedSubmitting = false;
-let rankedSubmitted = false;
-let rankedSubmissionError = null;
-let pendingGatewaySubmission = null;
-let rankedGithubFallbackVisible = false;
-let turnstileWidgetId = null;
-/** Hashes of the two binaries a replay is only reproducible against. */
-let binaryStamps = { engine: "", policy: "" };
 
 // Match score and win streak are tallied here, outside the engine: rebuilding
 // the handle via kf_new (reroll or mode/controller change) resets the
@@ -692,16 +916,6 @@ function streakSeat() {
 }
 
 function applyRoundEnd(winner) {
-  if (ranked) {
-    // Every outcome, draws included, so the run is scored by exactly the
-    // function the verifier will re-run against its own replay.
-    ranked.winners.push(winner);
-    ranked.best = longestShutout(ranked.winners).best;
-    if (ranked.winners.length >= LIMITS.maxRounds
-        || (POLICY_PILOT && ranked.best >= POLICY_PILOT_TARGET)) {
-      closeRankedSession();
-    }
-  }
   // -1: no winner yet; 2: double kill. Neither changes score or streak.
   if (winner !== 0 && winner !== 1) return;
   matchScore[winner] += 1;
@@ -722,10 +936,7 @@ function syncPlayOpponentControls() {
   openingDelayField.hidden = hideDelays;
 }
 
-/** Any new handle is a new match, so it ends whatever ranked session was
- *  running — a reroll, a different opponent and a mode switch all land here. */
-function newGame({ ranked: startRanked = false } = {}) {
-  closeRankedSession();
+function newGame() {
   const seed = POLICY_PILOT && POLICY_PILOT_SEED !== null
     ? POLICY_PILOT_SEED : (Math.random() * 0xffffffff) >>> 0;
   if (handle !== null) wasm.kf_free(handle);
@@ -740,7 +951,7 @@ function newGame({ ranked: startRanked = false } = {}) {
     handle = wasm.kf_new(seed, opponent === "laika" ? 1 : 0);
     hybridSeats = opponent === "hybrid" ? [0] : [];
     // The delay queue, the opening pause and Killfield's attachment all live
-    // in the driver, which the leaderboard verifier replays with verbatim.
+    // in the driver.
     opponentDriver = new OpponentDriver({
       opponent,
       delayFrames: reactionDelayFrames,
@@ -766,6 +977,9 @@ function newGame({ ranked: startRanked = false } = {}) {
       }
     });
   }
+  // Every new handle starts with crates off, so re-apply the preference.
+  wasm.kf_set_pickups_enabled(handle, pickupsEnabled ? 1 : 0);
+  applyForcedWeapon();
   syncTeamColors();
 
   roundFrames = 0;
@@ -779,204 +993,6 @@ function newGame({ ranked: startRanked = false } = {}) {
   // player real reaction time. Laika has no such hook — the engine drives it
   // unconditionally inside kf_step — so both delay controls are hidden for
   // that choice (see syncPlayOpponentControls).
-  if (startRanked) beginRankedSession(seed);
-}
-
-/** Start recording from a fresh handle. The seed is the one the session must
- *  be replayed from, so it is captured here and nowhere else. */
-function beginRankedSession(seed) {
-  ranked = {
-    recorder: new SessionRecorder(),
-    winners: [],
-    best: 0,
-    startedAt: Date.now(),
-    config: {
-      seed,
-      opponent: playOpponentSelect.value,
-      delayFrames: reactionDelayFrames,
-      // Laika is driven unconditionally inside kf_step and has no opening
-      // pause control; record the effective setting rather than the hidden
-      // slider's stale value.
-      openingDelaySeconds: playOpponentSelect.value === "laika" ? 0 : openingDelaySeconds,
-    },
-  };
-  rankedResult = null;
-  rankedSubmitting = false;
-  rankedSubmitted = false;
-  rankedSubmissionError = null;
-  pendingGatewaySubmission = null;
-  rankedGithubFallbackVisible = false;
-  matchScore = [0, 0];
-  streak.current = 0;
-  saveStreak();
-  syncRankedUI();
-}
-
-/** Close the recording without discarding it: whatever run it captured stays
- *  submittable. Anything that changes the match calls this. */
-function closeRankedSession() {
-  if (!ranked) return;
-  // Kept even when it falls short of the threshold, so the run can say how
-  // close it came instead of silently vanishing.
-  rankedResult = { ...ranked, frames: ranked.recorder.frameCount, endedAt: Date.now() };
-  ranked = null;
-  syncRankedUI();
-}
-
-function syncRankedUI() {
-  const s = t();
-  const set = (node, key, value) => { if (node[key] !== value) node[key] = value; };
-  set(rankedRow, "hidden", mode !== "play");
-  set(rankedStartButton, "textContent", ranked ? s.rankedStop : s.rankedStart);
-  rankedStartButton.disabled = rankedSubmitting;
-  rankedStartButton.classList.toggle("active", Boolean(ranked));
-  set(rankedUploadButton, "textContent", rankedSubmitting ? s.rankedSubmittingButton : s.rankedUpload);
-  set(rankedGithubFallbackButton, "textContent", s.rankedGithubFallback);
-  set(rankedGithubFallbackButton, "hidden", !rankedGithubFallbackVisible || rankedSubmitted);
-  set(rankedBoardLabel, "textContent", s.rankedBoard);
-  set(rankedNameLabel, "textContent", s.rankedNameLabel);
-  set(rankedGithubLabel, "textContent", s.rankedGithubLabel);
-  set(rankedNameInput, "placeholder", s.rankedNamePlaceholder);
-  set(rankedGithubInput, "placeholder", s.rankedGithubPlaceholder);
-  // A record goes on the board under a name; there is no anonymous entry.
-  rankedUploadButton.disabled = rankedSubmitting || rankedSubmitted
-    || rankedNameInput.value.trim() === "";
-  const eligible = rankedResult !== null && rankedResult.best >= MIN_SUBMITTABLE_SHUTOUT;
-  const shown = ranked ?? rankedResult;
-  set(rankedScore, "textContent", String(shown ? shown.best : 0));
-  set(rankedUnit, "textContent", s.rankedUnit);
-  rankedRow.classList.toggle("live", Boolean(ranked));
-  rankedRow.classList.toggle("qualified", eligible);
-  let status = s.rankedIdle;
-  if (rankedSubmissionError) {
-    status = rankedSubmissionError;
-  } else if (rankedSubmitted) {
-    status = s.rankedSubmitted;
-  } else if (rankedSubmitting) {
-    status = s.rankedSubmitting;
-  } else if (ranked) {
-    status = s.rankedRecording(ranked.best, ranked.winners.length, MIN_SUBMITTABLE_SHUTOUT);
-  } else if (rankedResult) {
-    status = eligible
-      ? s.rankedFinished(rankedResult.best)
-      : s.rankedTooShort(rankedResult.best, MIN_SUBMITTABLE_SHUTOUT);
-  }
-  set(rankedStatus, "textContent", status);
-  set(rankedSubmit, "hidden", !eligible || rankedSubmitted);
-}
-
-/**
- * Submit through the credential-isolating Worker. Turnstile executes only
- * after this one button press; most visitors get a token in the background,
- * while suspicious traffic may see the managed challenge in this same row.
- */
-async function uploadRankedResult() {
-  if (rankedResult === null || rankedSubmitting || rankedSubmitted) return;
-  try {
-    try {
-      localStorage.setItem(RANKED_NAME_STORAGE_KEY, rankedNameInput.value);
-      localStorage.setItem(RANKED_GITHUB_STORAGE_KEY, rankedGithubInput.value);
-    } catch { /* They just won't be remembered next time. */ }
-    pendingGatewaySubmission = await buildSubmission({
-      result: rankedResult,
-      name: rankedNameInput.value,
-      github: rankedGithubInput.value,
-      stamps: binaryStamps,
-    });
-    if (!SUBMIT_ENDPOINT || !TURNSTILE_SITEKEY) {
-      throw new Error(t().rankedNotConfigured);
-    }
-    if (!globalThis.turnstile) {
-      rankedGithubFallbackVisible = true;
-      throw new Error(t().rankedChallengeUnavailable);
-    }
-    rankedSubmitting = true;
-    rankedSubmissionError = null;
-    rankedGithubFallbackVisible = false;
-    syncRankedUI();
-    if (turnstileWidgetId === null) {
-      turnstileWidgetId = globalThis.turnstile.render(rankedTurnstile, {
-        sitekey: TURNSTILE_SITEKEY,
-        action: "leaderboard-submit",
-        appearance: "interaction-only",
-        execution: "execute",
-        callback: async (token) => {
-          try {
-            await submitToGateway(SUBMIT_ENDPOINT, pendingGatewaySubmission, token);
-            rankedSubmitting = false;
-            rankedSubmitted = true;
-            pendingGatewaySubmission = null;
-            globalThis.turnstile.reset(turnstileWidgetId);
-          } catch (error) {
-            rankedSubmitting = false;
-            rankedSubmissionError = error.code === "SUBMISSION_NETWORK_ERROR"
-              ? t().rankedNetworkFailed
-              : error.message ?? String(error);
-            rankedGithubFallbackVisible = error.code === "SUBMISSION_NETWORK_ERROR";
-            globalThis.turnstile.reset(turnstileWidgetId);
-          }
-          syncRankedUI();
-        },
-        "error-callback": () => {
-          rankedSubmitting = false;
-          rankedSubmissionError = t().rankedChallengeFailed;
-          rankedGithubFallbackVisible = true;
-          globalThis.turnstile.reset(turnstileWidgetId);
-          syncRankedUI();
-        },
-        "expired-callback": () => {
-          rankedSubmitting = false;
-          rankedSubmissionError = t().rankedChallengeFailed;
-          rankedGithubFallbackVisible = true;
-          globalThis.turnstile.reset(turnstileWidgetId);
-          syncRankedUI();
-        },
-      });
-    }
-    globalThis.turnstile.execute(turnstileWidgetId);
-  } catch (error) {
-    rankedSubmitting = false;
-    rankedSubmissionError = error.code === "SUBMISSION_NETWORK_ERROR"
-      ? t().rankedNetworkFailed
-      : error.message ?? String(error);
-    if (error.code === "SUBMISSION_NETWORK_ERROR") rankedGithubFallbackVisible = true;
-    syncRankedUI();
-  }
-}
-
-async function uploadRankedResultViaGithub() {
-  if (!pendingGatewaySubmission || !rankedGithubFallbackVisible) return;
-  // Opening the tab synchronously keeps this user click eligible under popup
-  // blockers while the clipboard operation completes.
-  const githubTab = window.open("about:blank", "_blank");
-  if (githubTab) githubTab.opener = null;
-  const fallback = await openSubmissionIssue(pendingGatewaySubmission);
-  if (!fallback.copied) {
-    githubTab?.close();
-    rankedSubmissionError = t().rankedGithubCopyFailed;
-    syncRankedUI();
-    return;
-  }
-  rankedSubmissionError = t().rankedGithubCopied;
-  if (githubTab) githubTab.location.replace(fallback.url);
-  else window.location.assign(fallback.url);
-  syncRankedUI();
-}
-
-/** Ranked runs face the default match: no actuation delay, the default opening
- *  pause, and the turn-rate assist off. Anything that would make the opponent
- *  easier is reset here rather than merely rejected later. */
-function startRankedSession() {
-  if (mode !== "play") setMode("play");
-  reactionDelayFrames = RANKED_DELAY_FRAMES;
-  reactionDelaySelect.value = String(RANKED_DELAY_FRAMES);
-  openingDelaySeconds = Math.min(openingDelaySeconds, RANKED_OPENING_DELAY_SECONDS);
-  themedPickers.forEach(syncThemedPicker);
-  syncReactionDelayControl();
-  syncOpeningDelayControl();
-  if (instantTurn) toggleInstantTurn();
-  rankedResult = null;
-  newGame({ ranked: true });
 }
 
 function setMode(next) {
@@ -1014,6 +1030,49 @@ function toggleInstantTurn() {
   instantTurnButton.blur();
 }
 
+function syncMouseAimButton() {
+  const s = t();
+  const on = mouseMode !== AIM_MODE_OFF;
+  mouseAimButton.classList.toggle("active", on);
+  mouseAimButton.textContent = mouseMode === AIM_MODE_DRIVE ? s.mouseDrive
+    : mouseMode === AIM_MODE_AIM ? s.mouseAimOn : s.mouseAimOff;
+  mouseAimButton.setAttribute("aria-label", s.mouseAimAria);
+  mouseAimButton.setAttribute("aria-pressed", String(on));
+}
+
+function setMouseMode(next) {
+  if (next === mouseMode) return;
+  mouseMode = next;
+  mouseAim.setMode(next);
+  try { localStorage.setItem(MOUSE_AIM_STORAGE_KEY, next); } catch { /* optional */ }
+  syncMouseAimButton();
+}
+
+/** One button, three states: off, cursor aims, cursor aims and drives. */
+function toggleMouseAim() {
+  setMouseMode(MOUSE_MODES[(MOUSE_MODES.indexOf(mouseMode) + 1) % MOUSE_MODES.length]);
+}
+
+function syncPickupsButton() {
+  const s = t();
+  pickupsButton.classList.toggle("active", pickupsEnabled);
+  pickupsButton.textContent = pickupsEnabled ? s.pickupsOn : s.pickupsOff;
+  pickupsButton.setAttribute("aria-label", s.pickupsAria);
+  pickupsButton.setAttribute("aria-pressed", String(pickupsEnabled));
+}
+
+/** The engine clears the floor when this goes off, and starts its own spawn
+ *  clock when it goes on; both take effect on the handle that is running. */
+function togglePickups() {
+  pickupsEnabled = !pickupsEnabled;
+  try { localStorage.setItem(PICKUPS_STORAGE_KEY, pickupsEnabled ? "1" : "0"); } catch { /* optional */ }
+  if (wasm !== null && handle !== null) {
+    wasm.kf_set_pickups_enabled(handle, pickupsEnabled ? 1 : 0);
+  }
+  syncPickupsButton();
+  pickupsButton.blur();
+}
+
 function updateScoreboard() {
   if (handle === null) return;
   const s = t();
@@ -1032,12 +1091,11 @@ function updateScoreboard() {
   if (roundline.textContent !== text) roundline.textContent = text;
   const streakText = s.streakLine(streak.current, streak.longest);
   if (streakline.textContent !== streakText) streakline.textContent = streakText;
-  syncRankedUI();
 }
 
 /**
  * Hand the opponent's action to the engine before kf_step consumes this
- * frame's controls, and return the Play-mode decision so it can be recorded.
+ * frame's controls.
  *
  * Play mode routes through OpponentDriver, which owns the actuation delay and
  * the opening pause; Watch mode has neither, and can drive both seats straight
@@ -1057,6 +1115,13 @@ function driveHybridSeats() {
   return null;
 }
 
+/** Re-arm the `?weapon=` debug loadout; fresh tanks each round drop it. */
+function applyForcedWeapon() {
+  if (FORCED_WEAPON === null) return;
+  const human = MODES[mode].humanTank;
+  if (human !== null) wasm.kf_set_weapon(handle, human, FORCED_WEAPON);
+}
+
 function tick() {
   // kf_step drives any attached Laika/MPC agent internally, so unlike
   // killfield's JS loop this only needs to push human input and any Hybrid
@@ -1069,17 +1134,24 @@ function tick() {
     // Fire is passed straight through by sampleWindowStrengths and its edges
     // are applied authoritatively by syncImmediateHumanFire(), so a released
     // trigger is never resurrected by the window.
-    if (POLICY_PILOT && ranked && hybridPolicy) {
+    if (POLICY_PILOT && hybridPolicy) {
       const own = readObservation(wasm, handle, human);
       humanInput = policyActionToInput(hybridPolicy.act(own.observation, own.mask, own.dodge));
       wasm.kf_set_input(handle, human, humanInput.forward, humanInput.backup,
         humanInput.turnLeft, humanInput.turnRight, humanInput.fire, 1);
     } else {
       const strengths = keyboard.sampleWindowStrengths(STEP_MS);
-      const rotation = previousRenderState?.tanks[human]?.rotation ?? 0;
-      const applied = touchControls.applyTo(
-        wasm, handle, human, strengths, rotation, instantTurn,
-      );
+      const pose = previousRenderState?.tanks[human] ?? null;
+      const rotation = pose?.rotation ?? 0;
+      // The cursor owns the heading only while it is over the canvas; off it,
+      // the wheel/keyboard path keeps its own turn keys.
+      const aim = cursorAimOffset(pose);
+      // Drive mode scales its throttle ramp by the round's cell size, so the
+      // feel is the same on a cramped 4x4 as on a 12x10.
+      const applied = aim !== null
+        ? mouseAim.applyTo(wasm, handle, human, strengths, aim, rotation, instantTurn,
+          renderBuffer()[2])
+        : touchControls.applyTo(wasm, handle, human, strengths, rotation, instantTurn);
       humanInput = applied.input;
       if (applied.snappedRotation !== null && previousRenderState?.tanks[human]) {
         // Physics and presentation both snap in the same frame.
@@ -1087,10 +1159,7 @@ function tick() {
       }
     }
   }
-  const decision = driveHybridSeats();
-  if (ranked && humanInput) {
-    ranked.recorder.frame(humanInput, decision ? decision.action : null);
-  }
+  driveHybridSeats();
   roundFrames += 1;
   const flags = wasm.kf_step(handle);
   if (opponentDriver) opponentDriver.afterStep(wasm, handle, flags);
@@ -1098,12 +1167,11 @@ function tick() {
   const buf = renderBuffer();
   currentRound = buf[9];
   frozen = buf[14] > 0.5;
-  if (flags & 1) roundFrames = 0; // new_round
+  if (flags & 1) { roundFrames = 0; applyForcedWeapon(); } // new_round
   if (flags & 64) applyRoundEnd(buf[15]); // round_end
-  // The verifier refuses longer tracks. Close at the same boundary in the
-  // browser so an unusually long qualifying session is not offered for upload
-  // only to be rejected later.
-  if (ranked && ranked.recorder.frameCount >= LIMITS.maxFrames) closeRankedSession();
+  // The policy pilot drives the human seat at 25x to self-test; ?target=N
+  // stops it once it has taken N rounds in a row.
+  if (POLICY_PILOT && streak.current >= POLICY_PILOT_TARGET && !paused) togglePause();
 }
 
 let last = performance.now();
@@ -1113,7 +1181,7 @@ function predictHumanForRender(buf, alpha) {
   const human = MODES[mode].humanTank;
   if (human === null || paused || frozen || buf[14] > 0.5) return null;
   const nWalls = buf[5] | 0;
-  const o = HEADER + nWalls * 4 + human * 6;
+  const o = HEADER + nWalls * 4 + human * TANK_SLOTS;
   if (buf[o + 3] < 0.5) return null;
   const pose = { x: buf[o], y: buf[o + 1], rotation: buf[o + 2] };
   // Same fixed one-frame window the authoritative tick uses. Scaling it by
@@ -1137,7 +1205,7 @@ function predictHumanForRender(buf, alpha) {
 }
 
 function syncImmediateHumanFire() {
-  const pressed = keyboardFirePressed || touchFirePressed;
+  const pressed = keyboardFirePressed || touchFirePressed || mouseFirePressed;
   if (pressed === immediateFirePressed) return;
   immediateFirePressed = pressed;
   const human = MODES[mode].humanTank;
@@ -1145,9 +1213,6 @@ function syncImmediateHumanFire() {
   // A release is always safe and must not be lost while paused/frozen, or the
   // next press could inherit a latched trigger. Only creation is gated.
   if (pressed && (paused || frozen)) return;
-  // Recorded at the point the edge really reaches the engine, not where the
-  // key changed: the two differ whenever an edge is swallowed above.
-  if (ranked) ranked.recorder.fireEdge(pressed);
   if (wasm.kf_set_fire_immediate(handle, human, pressed ? 1 : 0)) {
     sounds.playEvent(["fire"]);
   }
@@ -1162,18 +1227,18 @@ function frame(now) {
     // Don't let the gap pile up while paused, or unpausing would fast-forward.
     accumulator = 0;
   } else {
-    const steps = POLICY_PILOT && ranked ? POLICY_PILOT_STEPS_PER_FRAME : budget.steps;
+    const steps = POLICY_PILOT && mode === "play" ? POLICY_PILOT_STEPS_PER_FRAME : budget.steps;
     for (let i = 0; i < steps; i++) {
       previousRenderState = captureRenderState(renderBuffer());
       tick();
-      if (POLICY_PILOT && !ranked) break;
     }
     accumulator = budget.remainder;
   }
   const renderAlpha = paused ? 1 : Math.min(1, accumulator / STEP_MS);
   const buf = renderBuffer();
   const localPlayer = predictHumanForRender(buf, renderAlpha);
-  draw(buf, activeTankColors(), previousRenderState, renderAlpha, localPlayer);
+  draw(buf, activeTankColors(), previousRenderState, renderAlpha, localPlayer,
+    aimOverlayFor(localPlayer), laserPreviewFor(localPlayer, buf));
   updateScoreboard();
   requestAnimationFrame(frame);
 }
@@ -1299,12 +1364,11 @@ function toggleLanguage() {
 
 async function boot() {
   const [wasmBytes, hybrid] = await Promise.all([
-    fetch("kf_engine.wasm?v=7aea2a29").then((res) => res.arrayBuffer()),
-    HybridPolicy.load("assets/hybrid.json?v=942cb5c9", "assets/hybrid.bin?v=a6919c8f"),
+    fetch("kf_engine.wasm?v=db4128fa").then((res) => res.arrayBuffer()),
+    HybridPolicy.load("assets/hybrid.json?v=e23a108d", "assets/hybrid.bin?v=96d48cdf"),
   ]);
   // Hashed before instantiation so a record names the exact binaries it is
   // reproducible against, rather than a version string someone could bump.
-  binaryStamps = await buildStamps(new Uint8Array(wasmBytes), hybrid.weights);
   const wasmResult = await WebAssembly.instantiate(wasmBytes, {});
   wasm = wasmResult.instance.exports;
   hybridPolicy = hybrid;
@@ -1329,26 +1393,18 @@ async function boot() {
     touchFirePressed = pressed;
     syncImmediateHumanFire();
   };
-  rankedStartButton.addEventListener("click", () => {
-    if (ranked) closeRankedSession(); else startRankedSession();
-    rankedStartButton.blur();
+  mouseAim.onFireChange = (pressed) => {
+    mouseFirePressed = pressed;
+    syncImmediateHumanFire();
+  };
+  mouseAimButton.addEventListener("click", () => {
+    toggleMouseAim();
+    mouseAimButton.blur();
   });
-  rankedUploadButton.addEventListener("click", uploadRankedResult);
-  rankedGithubFallbackButton.addEventListener("click", uploadRankedResultViaGithub);
-  try {
-    rankedNameInput.value = localStorage.getItem(RANKED_NAME_STORAGE_KEY) ?? "";
-    rankedGithubInput.value = localStorage.getItem(RANKED_GITHUB_STORAGE_KEY) ?? "";
-  } catch { /* The boxes just start empty. */ }
-  rankedNameInput.addEventListener("input", syncRankedUI);
+  pickupsButton.addEventListener("click", togglePickups);
   rerollButton.addEventListener("click", () => { newGame(); rerollButton.blur(); });
   resetScoreButton.addEventListener("click", () => { resetScore(); resetScoreButton.blur(); });
-  instantTurnButton.addEventListener("click", () => {
-    toggleInstantTurn();
-    // Ranked pins this assist off. Rotation snaps are not part of the replay,
-    // so changing it mid-run closes the record instead of creating a result
-    // that the verifier cannot reproduce.
-    closeRankedSession();
-  });
+  instantTurnButton.addEventListener("click", () => toggleInstantTurn());
   pauseButton.addEventListener("click", () => { togglePause(); pauseButton.blur(); });
   soundButton.addEventListener("click", () => { toggleSound(); soundButton.blur(); });
   controllerSelects.forEach((select) => select.addEventListener("change", newGame));
@@ -1363,10 +1419,7 @@ async function boot() {
       localStorage.setItem(REACTION_DELAY_STORAGE_KEY, String(reactionDelayFrames));
     } catch { /* optional */ }
     if (handle !== null && mode === "play") wasm.kf_set_mpc_delay(handle, 0, reactionDelayFrames);
-    // Handing the opponent a delay mid-run changes the match the record says
-    // it was played under, so the run ends here rather than failing later.
     if (opponentDriver) opponentDriver.delayFrames = reactionDelayFrames;
-    closeRankedSession();
   });
   openingDelayInput.addEventListener("input", () => {
     openingDelaySeconds = normaliseOpeningDelay(openingDelayInput.value);
@@ -1378,7 +1431,6 @@ async function boot() {
       opponentDriver.openingDelayFrames = opponentDriver.opponent === "laika"
         ? 0 : openingDelayFrameCount();
     }
-    closeRankedSession();
   });
   watchButton.addEventListener("click", () => setMode("watch"));
   playButton.addEventListener("click", () => setMode("play"));
@@ -1393,18 +1445,16 @@ async function boot() {
   window.addEventListener("pointerdown", () => sounds.unlock(), { once: true, capture: true });
   window.addEventListener("keydown", () => sounds.unlock(), { once: true, capture: true });
 
-  // A hook for checking the recorder against the engine from outside this
-  // file — the leaderboard's whole claim is that a recorded session replays to
-  // the same rounds, and that is only checkable with both in hand. It exposes
+  // A hook for poking the engine and the policy from the console. It exposes
   // no capability a reader of this file does not already have.
   window.__kf = {
     get wasm() { return wasm; },
     get handle() { return handle; },
     get policy() { return hybridPolicy; },
-    get ranked() { return ranked ?? rankedResult; },
   };
 
-  setMode("watch");
+  // The pilot drives the human seat, so it needs Play mode to have one.
+  setMode(POLICY_PILOT ? "play" : "watch");
   applyLanguage();
   requestAnimationFrame(frame);
 }

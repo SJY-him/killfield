@@ -10,6 +10,8 @@
 //! ~200-byte POD out and back is cheaper than any aliasing workaround.
 
 use crate::constants as C;
+use crate::laser::{self, Beam};
+use crate::pickups::{self, Pickup, Weapon};
 use crate::laika::{laika_step, LaikaAI};
 use crate::maze::{
     build_wall_segments, calc_distances, calc_reachable, create_maze, find_dead_ends, Maze,
@@ -135,6 +137,13 @@ pub struct Tank {
 
     pub trigger_released: bool,
     pub bullets_fired: i32,
+    /// Current gun, its remaining shots, and the frames left before the
+    /// trigger unlocks. See `pickups.rs`; `Normal` is the default loadout.
+    pub weapon: Weapon,
+    pub weapon_charges: i32,
+    pub fire_cooldown: i32,
+    /// Absorbs exactly one lethal hit, then is gone.
+    pub shield: bool,
     pub alive: bool,
     pub hit_something: bool,
     pub wall_sliding: bool,
@@ -178,6 +187,10 @@ impl Tank {
             backup_amount: None,
             turn_left_amount: None,
             turn_right_amount: None,
+            weapon: Weapon::Normal,
+            weapon_charges: 0,
+            fire_cooldown: 0,
+            shield: false,
         }
     }
 
@@ -427,7 +440,7 @@ pub struct Bullet {
 }
 
 impl Bullet {
-    fn new(id: u32, owner: usize, owner_tank: &Tank, scale: f64) -> Self {
+    pub(crate) fn new(id: u32, owner: usize, owner_tank: &Tank, scale: f64) -> Self {
         let rad = (owner_tank.rotation - 90.0) * DEG;
         Bullet {
             id,
@@ -468,9 +481,20 @@ pub struct Game {
     pub reset_count: i32,
     pub frozen: bool,
     pub shake: f64,
-    /// Crates never spawn in a duel, but the timer still ticks and still draws
-    /// from the RNG on expiry, so it stays.
+    /// The original's crate clock. It predates the crates coming back and is
+    /// left alone: it draws from `rng` on every expiry, so retiring it would
+    /// shift the random stream every benchmark was measured on. `pickups.rs`
+    /// runs its own clock off its own chain instead.
     pub crate_timer: f64,
+
+    /// Weapon crates. Off by default, so an untouched build plays a seed
+    /// exactly as it did before this existed. See `pickups.rs`.
+    pub pickups_enabled: bool,
+    pub pickups: Vec<Pickup>,
+    pub pickup_timer: f64,
+    pub pickup_rng: Rng,
+    /// The last laser shot, kept only long enough to draw it. See `laser.rs`.
+    pub beam: Beam,
 
     pub scores: Vec<i32>,
     pub round_number: i32,
@@ -542,6 +566,11 @@ impl Game {
             frozen: false,
             shake: 0.0,
             crate_timer,
+            pickups_enabled: false,
+            pickups: Vec::new(),
+            pickup_timer: 0.0,
+            pickup_rng: pickups::new_rng(seed),
+            beam: Beam::default(),
             scores: vec![0; tanks],
             round_number: 0,
             frame: 0,
@@ -620,6 +649,10 @@ impl Game {
             let t = Tank::new(n, spawn_cells[n], self.scale, &mut self.rng);
             self.tanks.push(t);
         }
+        // Fresh tanks already carry the default loadout; this clears the floor
+        // and rerolls the crate clock for the new maze's size.
+        pickups::reset_round(self);
+        laser::clear(self);
 
         self.alive_count = tanks_n as i32;
 
@@ -671,10 +704,24 @@ impl Game {
         }
     }
 
+    /// A gatling's own magazine is deeper than the standard five, or its
+    /// higher rate of fire would spend the clip before the first shot lands.
+    #[inline]
+    pub fn in_flight_cap(&self, tank: usize) -> i32 {
+        match self.tanks[tank].weapon {
+            Weapon::Gatling => C::GATLING_MAX_IN_FLIGHT,
+            // A beam is not a projectile, so rounds already in the air from the
+            // gun you were holding must not lock the trigger.
+            Weapon::Laser => i32::MAX,
+            _ => self.settings_max_bullets,
+        }
+    }
+
     #[inline]
     pub fn weapon_ready(&self, tank: usize) -> bool {
         !self.weapons_disabled.get(tank).copied().unwrap_or(false)
-            && self.tanks[tank].bullets_fired < self.settings_max_bullets
+            && self.tanks[tank].fire_cooldown <= 0
+            && self.tanks[tank].bullets_fired < self.in_flight_cap(tank)
     }
 
     /// Inject a bullet from an arbitrary pose without touching the owner's
@@ -695,6 +742,15 @@ impl Game {
     }
 
     pub fn fire_weapon(&mut self, tank: usize) {
+        // The laser resolves inside this call instead of leaving a projectile,
+        // so it never touches `bullet_depth` or the magazine.
+        if self.tanks[tank].weapon == Weapon::Laser {
+            laser::fire(self, tank);
+            self.round_shots_fired[tank] += 1;
+            self.events.push(Event::Fire(self.tanks[tank].number));
+            pickups::note_shot(self, tank);
+            return;
+        }
         self.bullet_depth += 1;
         let b = Bullet::new(self.bullet_depth, tank, &self.tanks[tank], self.scale);
         let mut b = b;
@@ -705,6 +761,10 @@ impl Game {
         self.tanks[tank].bullets_fired += 1;
         self.round_shots_fired[tank] += 1;
         self.events.push(Event::Fire(self.tanks[tank].number));
+        // Side pellets first: they read the weapon before note_shot can spend
+        // the last charge and drop the tank back to the default gun.
+        pickups::extra_pellets(self, tank);
+        pickups::note_shot(self, tank);
     }
 
     /// Apply a human trigger edge immediately, between fixed simulation ticks.
@@ -739,6 +799,13 @@ impl Game {
     }
 
     pub fn destroy_tank(&mut self, number: usize) {
+        // A shield eats the hit and itself. The shake still fires so the hit
+        // reads as a hit, but nothing else about the round changes.
+        if self.tanks[number].shield {
+            self.tanks[number].shield = false;
+            self.shake = f64::max(C::MAXSHAKE / 2.0, self.shake + 3.0);
+            return;
+        }
         self.tanks[number].alive = false;
         self.alive_count -= 1;
         // Restart the settlement window. A second death during it re-arms this,
@@ -864,6 +931,14 @@ impl Game {
 
         if !self.frozen {
             self.crate_timer -= 1.0;
+            for i in 0..self.tanks_count {
+                if self.tanks[i].fire_cooldown > 0 {
+                    self.tanks[i].fire_cooldown -= 1;
+                }
+            }
+            pickups::tick_spawn(self);
+            pickups::collect(self);
+            laser::tick(self);
         }
         if !self.frozen && self.crate_timer <= 0.0 {
             self.crate_timer = C::CRATESPAWNTIMEBASE

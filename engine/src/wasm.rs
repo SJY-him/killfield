@@ -68,11 +68,19 @@ impl TankControls {
 ///   [12] alive count         [13] end count
 ///   [14] frozen              [15] last round winner (-1 none, 2 double death)
 ///   [16] painted cell count [17] current paint score
+///   [18] pickup count      [19] laser point count
+///   [20] laser alpha (1 on the frame it fired, fading to 0)
 ///   then 120 paint flags in x-major order
 ///   then  wall_count * 4   : x1, y1, x2, y2
-///   then  tank_count * 6   : x, y, rotation, alive, number, display_scale
+///   then  tank_count * 8   : x, y, rotation, alive, number, display_scale,
+///                            weapon code, shield
 ///   then  bullet_count * 2 : x, y
-pub const HEADER_SLOTS: usize = 18;
+///   then  pickup_count * 3 : x, y, weapon code
+///   then  laser_points * 2  : x, y   (a polyline, corner to corner)
+///
+/// Weapon codes come from `pickups::Weapon::code`: 0 none, 1 gatling,
+/// 2 shotgun, 3 shield.
+pub const HEADER_SLOTS: usize = 21;
 pub const PAINT_SLOTS: usize = 12 * 10;
 
 pub struct Handle {
@@ -123,6 +131,9 @@ fn build_render(h: &mut Handle) {
     out[15] = h.last_winner;
     out[16] = h.semantic_state.painted_count() as f32;
     out[17] = h.semantic_state.paint_score() as f32;
+    out[18] = g.pickups.len() as f32;
+    out[19] = g.beam.points.len() as f32;
+    out[20] = g.beam.alpha();
     out.extend(
         h.semantic_state
             .painted_cells()
@@ -140,10 +151,18 @@ fn build_render(h: &mut Handle) {
             if t.alive { 1.0 } else { 0.0 },
             t.number as f32,
             t.display_scale as f32,
+            t.weapon.code(),
+            if t.shield { 1.0 } else { 0.0 },
         ]);
     }
     for b in &g.bullets {
         out.extend_from_slice(&[b.x as f32, b.y as f32]);
+    }
+    for p in &g.pickups {
+        out.extend_from_slice(&[p.x as f32, p.y as f32, p.weapon.code()]);
+    }
+    for &(x, y) in &g.beam.points {
+        out.extend_from_slice(&[x as f32, y as f32]);
     }
 }
 
@@ -235,6 +254,100 @@ pub unsafe extern "C" fn kf_set_mpc_enabled(h: *mut Handle, tank: u32, enabled: 
         if enabled == 0 {
             h.agent_queue[tank as usize].clear();
         }
+    }
+}
+
+/// Scratch for `kf_laser_preview`, separate from `SCRATCH` so a preview and a
+/// telemetry read cannot tread on each other. A trace is at most one start,
+/// `LASER_MAX_BOUNCES` corners and one end.
+static mut LASER_PREVIEW: [f32; 2 + (2 + 3) * 2] = [0.0; 2 + (2 + 3) * 2];
+
+/// # Safety
+/// The returned pointer is valid for the module's lifetime.
+#[no_mangle]
+pub unsafe extern "C" fn kf_laser_preview_ptr() -> *mut f32 {
+    &raw mut LASER_PREVIEW as *mut f32
+}
+
+/// Walk the beam `tank` *would* fire at `rotation`, without firing it.
+///
+/// This is the aiming line for an instant bouncing weapon: without it the
+/// player has no way to know where a shot lands until after it has landed.
+/// Nothing here mutates the game — `laser::trace` takes `&Game`.
+///
+/// `rotation` comes from the caller rather than the tank so the viewer can
+/// trace from the hull angle it is drawing this instant; display prediction
+/// runs ahead of the authoritative pose, and a line drawn off the stale angle
+/// visibly hangs off the end of the barrel while turning.
+///
+/// Writes `[would_hit, point_count, x0, y0, x1, y1, ...]` to
+/// `kf_laser_preview_ptr` and returns the point count.
+///
+/// # Safety
+/// `h` must come from `kf_new`.
+#[no_mangle]
+pub unsafe extern "C" fn kf_laser_preview(h: *mut Handle, tank: u32, rotation: f32) -> u32 {
+    let h = &mut *h;
+    let i = tank as usize;
+    let out = &mut *(&raw mut LASER_PREVIEW);
+    out.fill(0.0);
+    if i >= h.game.tanks_count || !h.game.tanks[i].alive {
+        return 0;
+    }
+    let trace = crate::laser::trace(&h.game, i, rotation as f64);
+    let count = trace.points.len().min((out.len() - 2) / 2);
+    out[0] = if trace.victim.is_some_and(|v| v != i) { 1.0 } else { 0.0 };
+    out[1] = count as f32;
+    for (k, &(x, y)) in trace.points.iter().take(count).enumerate() {
+        out[2 + k * 2] = x as f32;
+        out[2 + k * 2 + 1] = y as f32;
+    }
+    count as u32
+}
+
+/// Put a weapon straight into a tank's hands, bypassing the crates.
+///
+/// For trying a weapon out without waiting on a random drop — the viewer wires
+/// it to a `?weapon=` query parameter, the same debug-hook convention
+/// `?pilot=policy` already uses. Codes match `pickups::Weapon::code`:
+/// 0 clears back to the default gun, 1 gatling, 2 shotgun, 3 shield, 4 laser.
+///
+/// # Safety
+/// `h` must come from `kf_new`.
+#[no_mangle]
+pub unsafe extern "C" fn kf_set_weapon(h: *mut Handle, tank: u32, code: u32) {
+    use crate::pickups::Weapon;
+    let h = &mut *h;
+    let i = tank as usize;
+    if i >= h.game.tanks_count {
+        return;
+    }
+    let weapon = match code {
+        1 => Weapon::Gatling,
+        2 => Weapon::Shotgun,
+        3 => Weapon::Shield,
+        4 => Weapon::Laser,
+        _ => Weapon::Normal,
+    };
+    if weapon == Weapon::Shield {
+        h.game.tanks[i].shield = true;
+        return;
+    }
+    h.game.tanks[i].weapon = weapon;
+    h.game.tanks[i].weapon_charges = weapon.charges();
+    h.game.tanks[i].fire_cooldown = 0;
+}
+
+/// Turn weapon crates on or off for this handle. Off is the default and is
+/// bit-for-bit the old game: `pickups.rs` draws from its own RNG chain, so
+/// enabling this changes what appears on the floor but never the maze, the
+/// spawns or anything the agents observe. Takes effect from the next round.
+#[no_mangle]
+pub unsafe extern "C" fn kf_set_pickups_enabled(h: *mut Handle, enabled: u32) {
+    let h = &mut *h;
+    h.game.pickups_enabled = enabled != 0;
+    if enabled == 0 {
+        h.game.pickups.clear();
     }
 }
 
@@ -767,6 +880,158 @@ mod hybrid_tests {
             assert_eq!((*handle).hybrid_history[0].frames, 2);
             let observation = kf_hybrid_observation(handle, 0);
             assert_eq!(*observation.add(CHANGE_RATE_OFFSET), 1.0);
+            kf_free(handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::constants as C;
+    use crate::pickups::Weapon;
+
+    /// The one link in the laser's chain that the engine tests cannot reach:
+    /// `laser.rs` proves the beam is computed, `laser::tests` proves it is
+    /// kept, but neither says it survives the trip into the flat `f32` buffer
+    /// the viewer actually draws from. A mistake here shows up as a beam that
+    /// simply never appears, with nothing in any log to explain it.
+    #[test]
+    fn a_fired_beam_reaches_the_render_buffer() {
+        unsafe {
+            let handle = kf_new(31, 0);
+            {
+                let g = &mut (*handle).game;
+                g.tanks[0].weapon = Weapon::Laser;
+                g.tanks[0].weapon_charges = C::LASER_CHARGES;
+                crate::laser::fire(g, 0);
+                assert!(g.beam.points.len() >= 2, "the engine produced no beam");
+            }
+            build_render(&mut *handle);
+            let out = &(*handle).render;
+
+            let point_count = out[19] as usize;
+            assert!(point_count >= 2, "the beam did not reach slot [19]");
+            assert_eq!(out[20], 1.0, "a fresh beam draws at full alpha");
+
+            // The polyline lives after the pickups, which come after the
+            // bullets. Anything off here draws a beam from garbage floats.
+            let n_walls = out[5] as usize;
+            let n_tanks = out[6] as usize;
+            let n_bullets = out[7] as usize;
+            let n_pickups = out[18] as usize;
+            let beam_base = HEADER_SLOTS + PAINT_SLOTS + n_walls * 4 + n_tanks * 6 + 2 * n_tanks
+                + n_bullets * 2 + n_pickups * 3;
+            assert_eq!(
+                out.len(),
+                beam_base + point_count * 2,
+                "the buffer's length disagrees with its own header",
+            );
+
+            let expected = &(*handle).game.beam.points;
+            for (i, &(x, y)) in expected.iter().enumerate() {
+                assert_eq!(out[beam_base + i * 2], x as f32, "beam point {i} x");
+                assert_eq!(out[beam_base + i * 2 + 1], y as f32, "beam point {i} y");
+            }
+            kf_free(handle);
+        }
+    }
+
+    /// The preview has to agree with the shot, or the aiming line is a lie.
+    #[test]
+    fn the_preview_matches_the_shot_it_predicts() {
+        unsafe {
+            let handle = kf_new(31, 0);
+            {
+                let g = &mut (*handle).game;
+                g.tanks[0].weapon = Weapon::Laser;
+                g.tanks[0].weapon_charges = C::LASER_CHARGES;
+            }
+            let rotation = (&(*handle).game).tanks[0].rotation as f32;
+
+            let count = kf_laser_preview(handle, 0, rotation) as usize;
+            let preview = &*(&raw const LASER_PREVIEW);
+            assert!(count >= 2, "no preview produced");
+            assert_eq!(preview[1] as usize, count);
+            let predicted: Vec<(f32, f32)> =
+                (0..count).map(|k| (preview[2 + k * 2], preview[2 + k * 2 + 1])).collect();
+
+            crate::laser::fire(&mut (*handle).game, 0);
+            let actual = &(&(*handle).game).beam.points;
+            assert_eq!(actual.len(), predicted.len(), "preview and shot differ in length");
+            for (k, &(x, y)) in actual.iter().enumerate() {
+                assert_eq!(predicted[k], (x as f32, y as f32), "corner {k} moved");
+            }
+            kf_free(handle);
+        }
+    }
+
+    /// And it must change nothing: it is called every drawn frame.
+    #[test]
+    fn previewing_does_not_touch_the_game() {
+        unsafe {
+            let handle = kf_new(31, 0);
+            {
+                let g = &mut (*handle).game;
+                g.tanks[0].weapon = Weapon::Laser;
+            }
+            let before = (&(*handle).game).tanks[1].alive;
+            let rng_before = (&(*handle).game).rng.state;
+            for _ in 0..50 {
+                kf_laser_preview(handle, 0, 0.0);
+                kf_laser_preview(handle, 0, 90.0);
+            }
+            assert_eq!((&(*handle).game).tanks[1].alive, before, "a preview killed someone");
+            assert_eq!((&(*handle).game).rng.state, rng_before, "a preview moved the RNG");
+            assert_eq!((&(*handle).game).beam.ttl, 0, "a preview left a beam behind");
+            kf_free(handle);
+        }
+    }
+
+    /// And it must say whether the shot connects, so the line can show it.
+    #[test]
+    fn the_preview_reports_a_connecting_shot() {
+        unsafe {
+            let handle = kf_new(31, 0);
+            let g = &mut (*handle).game;
+            g.tanks[0].rotation = 0.0;
+            g.tanks[1].x = g.tanks[0].x;
+            g.tanks[1].y = g.tanks[0].y - g.scale * 0.45;
+            kf_laser_preview(handle, 0, 0.0);
+            assert_eq!((&*(&raw const LASER_PREVIEW))[0], 1.0, "a point-blank shot reads as a miss");
+
+            // Turn away from the target; whatever the beam now finds, it is
+            // not an immediate hit on the tank that was in front.
+            {
+                let g = &mut (*handle).game;
+                g.tanks[1].alive = false;
+            }
+            kf_laser_preview(handle, 0, 0.0);
+            assert_eq!((&*(&raw const LASER_PREVIEW))[0], 0.0, "nothing alive to hit");
+            kf_free(handle);
+        }
+    }
+
+    /// And it must fade out rather than sitting on the floor forever.
+    #[test]
+    fn the_buffer_reports_the_beam_fading() {
+        unsafe {
+            let handle = kf_new(31, 0);
+            {
+                let g = &mut (*handle).game;
+                g.tanks[0].weapon = Weapon::Laser;
+                g.tanks[0].weapon_charges = C::LASER_CHARGES;
+                crate::laser::fire(g, 0);
+            }
+            let mut alphas = Vec::new();
+            for _ in 0..C::LASER_BEAM_FRAMES + 2 {
+                build_render(&mut *handle);
+                alphas.push((&(*handle).render)[20]);
+                kf_step(handle);
+            }
+            assert_eq!(alphas[0], 1.0);
+            assert!(alphas.windows(2).all(|w| w[1] <= w[0]), "alpha must never rise");
+            assert_eq!(*alphas.last().unwrap(), 0.0, "the beam must expire");
             kf_free(handle);
         }
     }

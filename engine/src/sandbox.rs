@@ -23,6 +23,7 @@
 
 use crate::game::{tank_update, Bullet, Game, Tank};
 use crate::laika::LaikaAI;
+use crate::laser::Beam;
 use crate::rng::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +67,18 @@ pub fn make_sandbox(g: &Game, me: usize, opp_model: OppModel, rng_seed: u32) -> 
         frozen: g.frozen,
         shake: g.shake,
         crate_timer: g.crate_timer,
+        // The planner cannot see crates — `duel_obs.rs` does not encode them
+        // and `score.rs` does not price them — so a rollout that spawned or
+        // collected them would be modelling something the search never gets to
+        // act on. Tank loadouts do carry over: the tanks are copied whole, so a
+        // gatling in hand is already reflected in the rollout's rate of fire.
+        pickups_enabled: false,
+        pickups: Vec::new(),
+        pickup_timer: 0.0,
+        pickup_rng: Rng::new(rng_seed),
+        // Purely a drawing artefact; a rollout has nothing to draw. A laser in
+        // the shooter's hands still carries over, because the tanks do.
+        beam: Beam::default(),
         scores,
         round_number: g.round_number,
         round_start_frame: g.round_start_frame,

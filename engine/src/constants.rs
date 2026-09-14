@@ -29,6 +29,62 @@ pub const CRATESPAWNTIMEBASE: f64 = 350.0;
 pub const CRATESPAWNTIMERANDOM: i32 = 200;
 pub const CRATESPAWNMAZESIZESCALE: f64 = 2000.0;
 
+// ---- weapon crates (see pickups.rs) ----
+/// The crates run on their own clock, NOT on `CRATESPAWNTIMEBASE`. Two
+/// reasons. The original's 350-frame base was tuned for human-vs-human rounds;
+/// against these agents a round is over in about 125 frames, so a crate on the
+/// old cadence would never once reach the floor. And the old constants still
+/// drive the vestigial `Game::crate_timer`, whose reset *rate* decides how
+/// often it draws from the game RNG — retuning them would shift the very
+/// stream `pickups::tests::enabling_crates_does_not_disturb_the_game_rng`
+/// exists to protect.
+pub const PICKUP_SPAWN_TIMEBASE: f64 = 50.0;
+pub const PICKUP_SPAWN_TIMERANDOM: i32 = 50;
+/// Bigger mazes wait a little longer, because there is more floor to cross.
+pub const PICKUP_SPAWN_MAZESIZESCALE: f64 = 600.0;
+
+/// Crates waiting to be collected at once. The original let the floor fill up;
+/// two keeps a duel about the fight rather than about shopping.
+pub const CRATE_MAX_ON_FIELD: usize = 2;
+/// Random cells probed for a free spot before giving up for this cycle.
+pub const CRATE_SPAWN_ATTEMPTS: i32 = 24;
+/// Cells of clearance from any live tank, so a crate never lands in your lap.
+pub const CRATE_SPAWN_CLEARANCE_CELLS: f64 = 1.25;
+/// How close the hull centre must be to collect. Under half a cell, so you
+/// have to drive onto it rather than past it.
+pub const CRATE_PICKUP_RADIUS_CELLS: f64 = 0.40;
+
+/// Gatling: shots per pickup, frames between them, and its own in-flight cap.
+/// The default five would make it barely distinguishable from the plain gun.
+pub const GATLING_CHARGES: i32 = 24;
+pub const GATLING_COOLDOWN_FRAMES: i32 = 2;
+pub const GATLING_MAX_IN_FLIGHT: i32 = 12;
+
+/// Laser: shots per pickup, wall bounces, range in cells, how finely the beam
+/// is marched, and how long the afterglow is drawn for. The cooldown is long
+/// on purpose — an instant, undodgeable hit has to be rationed.
+pub const LASER_CHARGES: i32 = 3;
+pub const LASER_COOLDOWN_FRAMES: i32 = 12;
+pub const LASER_MAX_BOUNCES: i32 = 3;
+pub const LASER_RANGE_CELLS: f64 = 14.0;
+/// March resolution. A hull is about a third of a cell across, so sixteen
+/// steps per cell puts five or so tests inside one — enough that the beam
+/// cannot tunnel through a tank.
+pub const LASER_STEPS_PER_CELL: i32 = 16;
+/// How long the beam stays on screen. It resolves in a single frame, so this
+/// is purely so a human can read where it went: eight frames was a flash you
+/// could not trace across three bounces. The first `HOLD` frames draw at full
+/// strength, the rest fade out. `laser::tick` is gated on `!frozen`, so a beam
+/// that ended the round also hangs in the air through the freeze.
+pub const LASER_BEAM_FRAMES: i32 = 45;
+pub const LASER_BEAM_HOLD_FRAMES: i32 = 10;
+
+/// Shotgun: trigger pulls per pickup, pellets either side of the centre one,
+/// and the angle between neighbouring pellets.
+pub const SHOTGUN_CHARGES: i32 = 4;
+pub const SHOTGUN_SIDE_PELLETS: i32 = 2;
+pub const SHOTGUN_SPREAD_DEG: f64 = 8.0;
+
 // ---- round lifecycle ----
 pub const NUMBEROFFRAMESBEFOREEND: i32 = 125; // world keeps running after a kill
 pub const NUMBEROFFRAMESFROZEN: i32 = 50; // freeze + score at this endCount
