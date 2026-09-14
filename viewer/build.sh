@@ -19,7 +19,31 @@ else
 fi
 
 cargo build --release --target wasm32-unknown-unknown --manifest-path ../engine/Cargo.toml
-cp ../engine/target/wasm32-unknown-unknown/release/kf_engine.wasm .
+
+# The page refuses a model whose schema disagrees with its own, so shipping an
+# engine that disagrees with the model bricks it — the canvas stays empty and
+# the only clue is a console line about an export that does not exist. Training
+# moves the schema forward long before a checkpoint exists at the new one, so
+# this is a normal state to be in, not a mistake; it just must not reach the
+# page. Refuse the copy instead, and say what to do about it.
+built=../engine/target/wasm32-unknown-unknown/release/kf_engine.wasm
+engine_schema="$(node -e "
+const fs = require('fs');
+WebAssembly.instantiate(fs.readFileSync('$built'), {})
+  .then(r => process.stdout.write(String(r.instance.exports.kf_hybrid_schema_version())))
+  .catch(() => process.stdout.write('?'));
+")"
+model_schema="$(node -e "
+process.stdout.write(String(require('./assets/hybrid.json').schema));
+")"
+if [ "$engine_schema" != "$model_schema" ]; then
+  echo "refusing to ship: engine is schema $engine_schema, assets/hybrid.json is schema $model_schema" >&2
+  echo "the page would load and then reject its own policy. Either:" >&2
+  echo "  - export a checkpoint trained at schema $engine_schema over assets/hybrid.*, or" >&2
+  echo "  - check out an engine at schema $model_schema to rebuild the page as it shipped" >&2
+  exit 1
+fi
+cp "$built" .
 wasm_stamp="$(stamp kf_engine.wasm)"
 style_stamp="$(stamp style.css)"
 hybrid_manifest_stamp="$(stamp assets/hybrid.json)"

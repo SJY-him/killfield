@@ -44,6 +44,7 @@
 use crate::constants as C;
 use crate::duel::DUEL_FRAMES;
 use crate::game::Game;
+use crate::pickups::Weapon;
 use crate::risk::{incoming_risk, reflective_closest};
 
 // ---------------------------------------------------------------- layout
@@ -95,6 +96,27 @@ pub const DODGE_DIM: usize = 9;
 pub const IDLE_STREAK_DIM: usize = 1;
 pub const IDLE_STREAK_CAP_FRAMES: u32 = 25;
 
+/// Weapon crates, appended for schema 25.
+///
+/// Everything here is strictly after `IDLE_STREAK_OFFSET`, so every channel
+/// schema 24 had keeps the index it had and a trained checkpoint widens into
+/// this layout by padding its scalar head with zero columns —
+/// `training/widen_obs.py` does exactly that. Nothing below may ever be
+/// inserted in the middle.
+///
+/// What a seat is carrying: the weapon as a one-hot over
+/// `pickups::Weapon::DROPS` plus "nothing", its remaining charges, whether a
+/// shield is up, and how many frames the trigger is still locked for.
+pub const LOADOUT_DIM: usize = 5 + 1 + 1 + 1;
+/// The crates on the floor, nearest first. Relative position, the real maze
+/// distance rather than the straight line, and which weapon it holds.
+pub const CRATE_SLOTS: usize = 2;
+pub const CRATE_DIM: usize = 1 + 2 + 1 + 5;
+/// The laser has no projectile, so none of the bullet machinery can see it
+/// coming. These two say whether the opponent's beam would reach this seat if
+/// it fired right now, and how far off its aim currently is.
+pub const LASER_THREAT_DIM: usize = 2;
+
 pub const MAP_OFFSET: usize = 0;
 pub const RAY_OFFSET: usize = MAP_OFFSET + MAP_DIM;
 pub const SELF_OFFSET: usize = RAY_OFFSET + RAY_COUNT;
@@ -111,12 +133,16 @@ pub const OLDER_ACTIONS_OFFSET: usize = SELF_THREAT_COUNT_OFFSET + SELF_THREAT_C
 pub const CHANGE_RATE_OFFSET: usize = OLDER_ACTIONS_OFFSET + OLDER_ACTIONS_DIM;
 pub const DODGE_OFFSET: usize = CHANGE_RATE_OFFSET + CHANGE_RATE_DIM;
 pub const IDLE_STREAK_OFFSET: usize = DODGE_OFFSET + DODGE_DIM;
-pub const OBS_DIM: usize = IDLE_STREAK_OFFSET + IDLE_STREAK_DIM;
+pub const SELF_LOADOUT_OFFSET: usize = IDLE_STREAK_OFFSET + IDLE_STREAK_DIM;
+pub const OPPONENT_LOADOUT_OFFSET: usize = SELF_LOADOUT_OFFSET + LOADOUT_DIM;
+pub const CRATE_OFFSET: usize = OPPONENT_LOADOUT_OFFSET + LOADOUT_DIM;
+pub const LASER_THREAT_OFFSET: usize = CRATE_OFFSET + CRATE_SLOTS * CRATE_DIM;
+pub const OBS_DIM: usize = LASER_THREAT_OFFSET + LASER_THREAT_DIM;
 
 /// Bumped whenever any of the above changes. The trainer stamps it into every
 /// checkpoint manifest and the viewer refuses a model that disagrees, so a
 /// layout change can never silently drive an old policy.
-pub const OBS_SCHEMA_VERSION: u32 = 24;
+pub const OBS_SCHEMA_VERSION: u32 = 25;
 
 // ------------------------------------------------------------- normalisers
 
@@ -576,6 +602,103 @@ pub fn encode(
         (history.idle_streak.min(IDLE_STREAK_CAP_FRAMES) as f32
             / IDLE_STREAK_CAP_FRAMES as f32)
             .clamp(0.0, 1.0);
+
+    encode_pickups(game, tank, other, v);
+}
+
+/// Weapon crates, the loadouts they produce, and the one threat the bullet
+/// channels cannot represent.
+///
+/// All zero when `pickups_enabled` is false, which is what makes a schema-25
+/// checkpoint play a crate-free game exactly as its schema-24 ancestor did.
+fn encode_pickups(game: &Game, tank: usize, other: usize, v: &mut [f32; OBS_DIM]) {
+    write_loadout(game, tank, &mut v[SELF_LOADOUT_OFFSET..][..LOADOUT_DIM]);
+    write_loadout(game, other, &mut v[OPPONENT_LOADOUT_OFFSET..][..LOADOUT_DIM]);
+
+    // Nearest first by the distance that matters — around the walls, not
+    // through them. A crate three cells away behind a wall is not a crate
+    // three cells away.
+    let me = (game.tanks[tank].x, game.tanks[tank].y);
+    let cell = |x: f64, y: f64| {
+        ((x / game.scale).floor() as i64, (y / game.scale).floor() as i64)
+    };
+    let (mx, my) = cell(me.0, me.1);
+    let mut ranked: Vec<(f32, usize)> = game
+        .pickups
+        .iter()
+        .enumerate()
+        .map(|(index, crate_)| {
+            let (cx, cy) = cell(crate_.x, crate_.y);
+            let steps = game
+                .dist_map(mx, my)
+                .and_then(|d| {
+                    let h = game.maze.h as i64;
+                    if cx >= 0 && cy >= 0 && (cx as usize) < game.maze.w && (cy as usize) < game.maze.h {
+                        d.get(cx as usize * h as usize + cy as usize).copied()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(f64::INFINITY);
+            (steps as f32, index)
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    for slot in 0..CRATE_SLOTS {
+        let out = &mut v[CRATE_OFFSET + slot * CRATE_DIM..][..CRATE_DIM];
+        let Some(&(steps, index)) = ranked.get(slot) else { continue };
+        let crate_ = game.pickups[index];
+        out[0] = 1.0; // this slot holds a crate
+        out[1] = ((crate_.x - me.0) / (game.scale * MAX_PATH_CELLS)).clamp(-1.0, 1.0) as f32;
+        out[2] = ((crate_.y - me.1) / (game.scale * MAX_PATH_CELLS)).clamp(-1.0, 1.0) as f32;
+        out[3] = if steps.is_finite() {
+            (steps / MAX_PATH_CELLS as f32).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        weapon_one_hot(crate_.weapon, &mut out[4..9]);
+    }
+
+    // The laser resolves inside one frame and leaves no projectile, so every
+    // bullet channel reads "clear" right up until the shot lands. Without this
+    // the policy has no way to learn that standing in a corridor opposite a
+    // tank holding a laser is fatal.
+    if game.tanks[other].weapon == Weapon::Laser && game.tanks[other].alive {
+        let trace = crate::laser::trace(game, other, game.tanks[other].rotation);
+        v[LASER_THREAT_OFFSET] = (trace.victim == Some(tank)) as u8 as f32;
+        // How far their aim is from the shot that would hit, as a fraction of
+        // half a turn: 0 means already lined up.
+        let dx = game.tanks[tank].x - game.tanks[other].x;
+        let dy = game.tanks[tank].y - game.tanks[other].y;
+        let bearing = dy.atan2(dx).to_degrees() + 90.0;
+        let mut off = (bearing - game.tanks[other].rotation) % 360.0;
+        if off > 180.0 {
+            off -= 360.0;
+        } else if off < -180.0 {
+            off += 360.0;
+        }
+        v[LASER_THREAT_OFFSET + 1] = (off.abs() / 180.0).clamp(0.0, 1.0) as f32;
+    } else {
+        // No laser pointed at anyone: "perfectly safe" is zero threat and a
+        // full turn away, not zero on both, or "they are aimed at me" and
+        // "there is no laser" would read the same.
+        v[LASER_THREAT_OFFSET + 1] = 1.0;
+    }
+}
+
+fn write_loadout(game: &Game, tank: usize, out: &mut [f32]) {
+    let t = &game.tanks[tank];
+    weapon_one_hot(t.weapon, &mut out[0..5]);
+    let capacity = t.weapon.charges().max(1) as f32;
+    out[5] = (t.weapon_charges as f32 / capacity).clamp(0.0, 1.0);
+    out[6] = t.shield as u8 as f32;
+    out[7] = (t.fire_cooldown as f32 / C::GATLING_COOLDOWN_FRAMES.max(1) as f32).clamp(0.0, 1.0);
+}
+
+/// `[none, gatling, shotgun, shield, laser]`, matching `Weapon::code`.
+fn weapon_one_hot(weapon: Weapon, out: &mut [f32]) {
+    out[weapon.code() as usize] = 1.0;
 }
 
 #[cfg(test)]
@@ -603,14 +726,70 @@ mod tests {
     fn the_layout_adds_up() {
         assert_eq!(MAP_DIM, 840);
         assert_eq!(BULLET_SLOTS * BULLET_DIM, 100);
-        assert_eq!(OBS_DIM, 1028);
-        assert_eq!(IDLE_STREAK_OFFSET + IDLE_STREAK_DIM, OBS_DIM);
+        assert_eq!(OBS_DIM, 1064);
+        assert_eq!(LASER_THREAT_OFFSET + LASER_THREAT_DIM, OBS_DIM);
         // Everything schema 21 had must still be where it was, or a widened
         // checkpoint lands its old weights on the wrong channels.
         assert_eq!(LAST_ACTION_OFFSET, 1007);
         assert_eq!(SELF_THREAT_COUNT_OFFSET, 1010);
         assert_eq!(DODGE_OFFSET, 1018);
         assert_eq!(IDLE_STREAK_OFFSET, 1027);
+        // And schema 25 may only append. 1028 is where schema 24 ended, so
+        // every crate channel has to start at or after it — that is the whole
+        // reason `widen_obs.py` can pad a trained checkpoint with zero columns
+        // instead of rebuilding it.
+        assert_eq!(SELF_LOADOUT_OFFSET, 1028);
+        assert_eq!(OPPONENT_LOADOUT_OFFSET, 1036);
+        assert_eq!(CRATE_OFFSET, 1044);
+        assert_eq!(LASER_THREAT_OFFSET, 1062);
+    }
+
+    /// A schema-25 engine with crates off has to produce exactly the
+    /// observation schema 24 produced, in the 1028 channels they share and in
+    /// the 36 new ones. Otherwise a widened checkpoint changes behaviour the
+    /// moment it loads, before it has been trained on anything, and any
+    /// comparison against its ancestor is meaningless.
+    #[test]
+    fn the_appended_channels_are_inert_without_crates() {
+        for seed in [3u32, 17, 20_260_862] {
+            let (mut game, mut state) = fixture(seed);
+            assert!(!game.pickups_enabled, "the duel fixture must start crate-free");
+            let mut rng = crate::rng::Rng::new(seed ^ 9);
+            let mut obs = DuelObservation::default();
+            for _ in 0..200 {
+                let action = (rng.random() * crate::duel::DUEL_ACTIONS as f64) as u16;
+                apply_duel_action(&mut game, 0, action);
+                state.record_action(action);
+                state.before_step(&mut game);
+                // No `duel_settle` here: this only cares about what the
+                // encoder writes, and settling past a round end would rebuild
+                // the arena underneath the loop.
+                game.step();
+                encode(&game, 0, &state.prev_pose, &state.boxes, &state.own_history(), &mut obs);
+
+                // Both seats hold the default gun: one-hot says "nothing", and
+                // every other loadout channel is zero.
+                for base in [SELF_LOADOUT_OFFSET, OPPONENT_LOADOUT_OFFSET] {
+                    assert_eq!(obs.values[base], 1.0, "weapon one-hot should be 'none'");
+                    for i in 1..LOADOUT_DIM {
+                        assert_eq!(obs.values[base + i], 0.0, "loadout channel {i} is not clear");
+                    }
+                }
+                // No crates on the floor, so every crate slot is empty.
+                for slot in 0..CRATE_SLOTS {
+                    for i in 0..CRATE_DIM {
+                        assert_eq!(
+                            obs.values[CRATE_OFFSET + slot * CRATE_DIM + i], 0.0,
+                            "crate slot {slot} channel {i} is not clear",
+                        );
+                    }
+                }
+                // Nobody holds a laser: no threat, and a full turn away rather
+                // than zero, which would read as "lined up on me".
+                assert_eq!(obs.values[LASER_THREAT_OFFSET], 0.0);
+                assert_eq!(obs.values[LASER_THREAT_OFFSET + 1], 1.0);
+            }
+        }
     }
 
     #[test]

@@ -44,8 +44,12 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(seed: u32, opponent: Opponent) -> Self {
-        let game = duel_game(seed, opponent);
+    fn new(seed: u32, opponent: Opponent, pickups: bool) -> Self {
+        let mut game = duel_game(seed, opponent);
+        // Set before `DuelState::new`, which reads the arena the round starts
+        // with. A slot keeps one `Game` across rounds, so this is the only
+        // place the flag has to be applied.
+        game.pickups_enabled = pickups;
         let state = DuelState::new(seed, opponent, &game);
         Slot {
             game,
@@ -73,6 +77,9 @@ struct SlotResult {
 
 pub struct DuelVecEnv {
     slots: Vec<Slot>,
+    /// Whether crates spawn. Held here because `reset_done` builds fresh slots
+    /// and they have to inherit it.
+    pickups: bool,
     rng: Rng,
     next_seed: u32,
     /// Worker threads for the per-slot loop. A planner opponent costs ~225 us
@@ -113,6 +120,7 @@ impl DuelVecEnv {
         mpc_weight: f64,
         frozen_weight: f64,
         threads: usize,
+        pickups: bool,
     ) -> Self {
         let threads = if threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
@@ -129,10 +137,11 @@ impl DuelVecEnv {
         let mut slots = Vec::with_capacity(count);
         for i in 0..count {
             let opponent = draw_opponent(&mut rng, &opponent_cdf);
-            slots.push(Slot::new(base_seed.wrapping_add(i as u32), opponent));
+            slots.push(Slot::new(base_seed.wrapping_add(i as u32), opponent, pickups));
         }
         let mut env = DuelVecEnv {
             slots,
+            pickups,
             rng,
             next_seed: base_seed.wrapping_add(count as u32),
             threads,
@@ -334,6 +343,7 @@ impl DuelVecEnv {
     /// sequence stays reproducible from the base seed regardless of how the
     /// work is divided.
     pub fn reset_done(&mut self) {
+        let pickups = self.pickups;
         let pending: Vec<(usize, u32, Opponent)> = (0..self.slots.len())
             .filter(|&i| self.slots[i].done)
             .map(|i| {
@@ -353,7 +363,7 @@ impl DuelVecEnv {
             for (work, out) in pending.chunks(chunk).zip(built.chunks_mut(chunk)) {
                 scope.spawn(move || {
                     for (k, &(_, seed, opponent)) in work.iter().enumerate() {
-                        let mut slot = Slot::new(seed, opponent);
+                        let mut slot = Slot::new(seed, opponent, pickups);
                         Self::encode_into_slot(&mut slot);
                         out[k] = Some(slot);
                     }
@@ -371,6 +381,24 @@ impl DuelVecEnv {
     }
 }
 
+/// `pickups` is a `0`/`1` flag rather than part of the opponent mix: crates
+/// are a property of the game being played, not of who is playing it. Off
+/// reproduces the crate-free duel every published benchmark was measured on,
+/// which is what makes a schema-25 checkpoint comparable to its ancestor.
+#[no_mangle]
+pub extern "C" fn kf_duel_new_with_pickups(
+    count: u32,
+    base_seed: u32,
+    laika_permille: u32,
+    mpc_permille: u32,
+    frozen_permille: u32,
+    threads: u32,
+    pickups: u32,
+) -> *mut DuelVecEnv {
+    new_env(count, base_seed, laika_permille, mpc_permille, frozen_permille,
+            threads, pickups != 0)
+}
+
 #[no_mangle]
 pub extern "C" fn kf_duel_new(
     count: u32,
@@ -380,6 +408,19 @@ pub extern "C" fn kf_duel_new(
     frozen_permille: u32,
     threads: u32,
 ) -> *mut DuelVecEnv {
+    new_env(count, base_seed, laika_permille, mpc_permille, frozen_permille,
+            threads, false)
+}
+
+fn new_env(
+    count: u32,
+    base_seed: u32,
+    laika_permille: u32,
+    mpc_permille: u32,
+    frozen_permille: u32,
+    threads: u32,
+    pickups: bool,
+) -> *mut DuelVecEnv {
     let count = count.max(1) as usize;
     Box::into_raw(Box::new(DuelVecEnv::new(
         count,
@@ -388,6 +429,7 @@ pub extern "C" fn kf_duel_new(
         mpc_permille as f64,
         frozen_permille as f64,
         threads as usize,
+        pickups,
     )))
 }
 
@@ -515,7 +557,7 @@ mod tests {
         // does not tell a finished round from a live one. `terminals` does,
         // and that is what the trainer's GAE cuts the bootstrap on — nothing
         // in the training path infers the end of an episode from the reward.
-        let mut env = DuelVecEnv::new(8, 100, 1.0, 0.0, 0.0, 2);
+        let mut env = DuelVecEnv::new(8, 100, 1.0, 0.0, 0.0, 2, false);
         let mut rng = Rng::new(1);
         let actions: Vec<u16> = (0..8).map(|_| (rng.random() * 18.0) as u16).collect();
         let mut terminals_seen = 0;
@@ -546,7 +588,7 @@ mod tests {
 
     #[test]
     fn every_episode_reaches_a_real_result() {
-        let mut env = DuelVecEnv::new(16, 7, 1.0, 0.0, 0.0, 4);
+        let mut env = DuelVecEnv::new(16, 7, 1.0, 0.0, 0.0, 4, false);
         let seen = run(&mut env, 900);
         assert!(!seen.is_empty(), "no episode finished in 900 frames");
         assert!(
@@ -557,7 +599,7 @@ mod tests {
 
     #[test]
     fn the_opponent_mix_is_drawn_per_episode() {
-        let env = DuelVecEnv::new(64, 21, 0.5, 0.5, 0.0, 4);
+        let env = DuelVecEnv::new(64, 21, 0.5, 0.5, 0.0, 4, false);
         let mpc = env.opponents.iter().filter(|&&o| o == 1).count();
         assert!((8..56).contains(&mpc), "half-and-half produced {mpc}/64 planners");
 
@@ -567,7 +609,7 @@ mod tests {
             ((0.0, 1.0, 0.0), 1),
             ((0.0, 0.0, 1.0), 2),
         ] {
-            let only = DuelVecEnv::new(16, 3, weights.0, weights.1, weights.2, 2);
+            let only = DuelVecEnv::new(16, 3, weights.0, weights.1, weights.2, 2, false);
             assert!(
                 only.opponents.iter().all(|&o| o == want),
                 "weights {weights:?} produced {:?}",
@@ -579,7 +621,7 @@ mod tests {
     #[test]
     fn a_three_way_pool_lands_near_its_weights() {
         // 40 / 40 / 20 over 512 slots.
-        let env = DuelVecEnv::new(512, 4242, 0.4, 0.4, 0.2, 4);
+        let env = DuelVecEnv::new(512, 4242, 0.4, 0.4, 0.2, 4, false);
         let share = |k: u8| {
             env.opponents.iter().filter(|&&o| o == k).count() as f64 / 512.0
         };
@@ -594,7 +636,7 @@ mod tests {
 
     #[test]
     fn a_frozen_opponent_publishes_its_own_view_and_plays_what_it_is_given() {
-        let mut env = DuelVecEnv::new(8, 77, 0.0, 0.0, 1.0, 2);
+        let mut env = DuelVecEnv::new(8, 77, 0.0, 0.0, 1.0, 2, false);
         assert!(env.needs_action.iter().all(|&n| n == 1), "every slot needs an action");
 
         // Its observation must be a real encoding, not a zeroed buffer, and it
@@ -610,7 +652,7 @@ mod tests {
         }
 
         // Driving tank 1 forward must actually move it.
-        let mut env = DuelVecEnv::new(1, 5, 0.0, 0.0, 1.0, 1);
+        let mut env = DuelVecEnv::new(1, 5, 0.0, 0.0, 1.0, 1, false);
         let before = env.slots[0].game.tanks[1];
         for _ in 0..12 {
             env.step(&[8], &[14]); // [2,1,0]: opponent drives forward
@@ -627,7 +669,7 @@ mod tests {
     fn a_frozen_opponent_with_no_action_supplied_simply_holds_still() {
         // The null-pointer path: the trainer may legitimately have nothing to
         // say on the very first frame.
-        let mut env = DuelVecEnv::new(2, 9, 0.0, 0.0, 1.0, 1);
+        let mut env = DuelVecEnv::new(2, 9, 0.0, 0.0, 1.0, 1, false);
         let before = env.slots[0].game.tanks[1];
         env.step(&[8, 8], &[]);
         let after = env.slots[0].game.tanks[1];
@@ -636,7 +678,7 @@ mod tests {
 
     #[test]
     fn slots_do_not_share_a_maze() {
-        let env = DuelVecEnv::new(8, 500, 1.0, 0.0, 0.0, 2);
+        let env = DuelVecEnv::new(8, 500, 1.0, 0.0, 0.0, 2, false);
         let mut shapes = std::collections::HashSet::new();
         for slot in &env.slots {
             shapes.insert(slot.game.maze.cells.clone());
@@ -646,7 +688,7 @@ mod tests {
 
     #[test]
     fn the_observation_buffer_stays_in_range() {
-        let mut env = DuelVecEnv::new(8, 88, 0.75, 0.25, 0.0, 4);
+        let mut env = DuelVecEnv::new(8, 88, 0.75, 0.25, 0.0, 4, false);
         let mut rng = Rng::new(9);
         for _ in 0..250 {
             let actions: Vec<u16> = (0..8).map(|_| (rng.random() * 18.0) as u16).collect();
@@ -660,7 +702,7 @@ mod tests {
 
     #[test]
     fn a_done_slot_comes_back_with_a_fresh_round() {
-        let mut env = DuelVecEnv::new(4, 1234, 1.0, 0.0, 0.0, 2);
+        let mut env = DuelVecEnv::new(4, 1234, 1.0, 0.0, 0.0, 2, false);
         let stand_still = vec![8u16; 4];
         for _ in 0..(DUEL_FRAMES + DUEL_GRACE_FRAMES + 10) {
             env.step(&stand_still, &[]);

@@ -15,8 +15,8 @@ import numpy as np
 
 # Mirrored from engine/src/duel_obs.rs. Checked against the engine's own
 # reported values at construction rather than trusted.
-OBS_SCHEMA_VERSION = 24
-OBS_DIM = 1028
+OBS_SCHEMA_VERSION = 25
+OBS_DIM = 1064
 BULLET_SLOTS = 10
 ACTIONS = 18
 
@@ -62,10 +62,15 @@ DEFAULT_LIBRARY = _default_library()
 
 class DuelVec:
     def __init__(self, count: int, seed: int, weights=(1.0, 0.0, 0.0),
-                 threads: int = 0, library: Path = DEFAULT_LIBRARY):
+                 threads: int = 0, library: Path = DEFAULT_LIBRARY,
+                 pickups: bool = False):
         """`weights` is (laika, mpc, frozen); it is normalised, not required to
         sum to one. A frozen slot publishes tank 1's observation and expects an
-        action back — see `obs_opponent` and `needs_action`."""
+        action back — see `obs_opponent` and `needs_action`.
+
+        `pickups` turns the weapon crates on. Off by default, because that is
+        the game every published benchmark was measured on and the only setting
+        under which a schema-25 checkpoint is comparable to its ancestor."""
         self.count = count
         self.lib = ctypes.CDLL(str(Path(library).resolve()))
 
@@ -81,11 +86,18 @@ class DuelVec:
             int(self.lib.kf_duel_obs_schema_version()),
         )
         expected = (OBS_DIM, BULLET_SLOTS, ACTIONS, OBS_SCHEMA_VERSION)
-        if IDLE_STREAK_INDEX != OBS_DIM - 1 or DODGE_OFFSET + DODGE_DIM != IDLE_STREAK_INDEX:
+        # The gates read fixed indices, so a layout change that moved any of
+        # them would silently feed the policy the wrong channel. Schema 25
+        # appends past IDLE_STREAK_INDEX, so it is no longer last — what has
+        # to hold is that the dodge block still runs straight into it and that
+        # everything still lands inside the observation.
+        if DODGE_OFFSET + DODGE_DIM != IDLE_STREAK_INDEX or IDLE_STREAK_INDEX >= OBS_DIM:
             raise RuntimeError(
-                "the gate offsets do not tile the end of the observation; "
+                "the gate offsets no longer line up with the observation; "
                 "duel_obs.rs moved them and duel_env.py was not updated"
             )
+        if max(AMMO_INDEX, HIT_INDEX, SUICIDE_INDEX, ETA_INDEX) >= OBS_DIM:
+            raise RuntimeError("a fire-gate index falls outside the observation")
         if native != expected:
             raise RuntimeError(
                 f"engine/python schema mismatch: {native} != {expected}. "
@@ -95,8 +107,8 @@ class DuelVec:
         self.episode_frames = int(self.lib.kf_duel_frames())
         self.grace_frames = int(self.lib.kf_duel_grace_frames())
 
-        self.lib.kf_duel_new.argtypes = [ctypes.c_uint32] * 6
-        self.lib.kf_duel_new.restype = ctypes.c_void_p
+        self.lib.kf_duel_new_with_pickups.argtypes = [ctypes.c_uint32] * 7
+        self.lib.kf_duel_new_with_pickups.restype = ctypes.c_void_p
         self.lib.kf_duel_step.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_uint16),
@@ -109,7 +121,10 @@ class DuelVec:
         permille = [int(round(1000 * max(0.0, w) / total)) for w in weights]
         self.weights = tuple(w / total for w in weights)
         # threads=0 lets the engine ask the OS how many cores it has.
-        self.handle = self.lib.kf_duel_new(count, seed, *permille, threads)
+        self.pickups = bool(pickups)
+        self.handle = self.lib.kf_duel_new_with_pickups(
+            count, seed, *permille, threads, int(self.pickups),
+        )
 
         self.obs = self._view("kf_duel_obs", ctypes.c_float, (count, OBS_DIM))
         self.masks = self._view("kf_duel_masks", ctypes.c_uint8, (count, BULLET_SLOTS))
