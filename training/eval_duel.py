@@ -51,8 +51,8 @@ def load(run: Path, device: torch.device) -> tuple[torch.nn.Module, dict]:
 
 @torch.inference_mode()
 def evaluate(model, device, episodes: int, envs: int, weights,
-             seed: int, sample: bool, frozen=None):
-    env = DuelVec(envs, seed, weights)
+             seed: int, sample: bool, frozen=None, pickups: bool = False):
+    env = DuelVec(envs, seed, weights, pickups=pickups)
     results = {name: {k: 0 for k in ("win", "loss", "double", "draw")}
                for name in OPPONENT_NAMES.values()}
     frames_seen = []
@@ -163,6 +163,10 @@ def main():
     parser.add_argument("--frozen", type=Path, default=None,
                         help="checkpoint driving the frozen slots of the pool")
     parser.add_argument("--seed", type=int, default=9_000)
+    parser.add_argument("--pickups", action="store_true",
+                        help="evaluate with weapon crates on. Must match how "
+                             "the checkpoint was trained, or the comparison "
+                             "is between two different games")
     parser.add_argument("--both", action="store_true",
                         help="also evaluate the sampled policy for comparison")
     args = parser.parse_args()
@@ -188,11 +192,13 @@ def main():
 
     report("argmax（网页看到的就是这个）",
            evaluate(model, device, args.episodes, args.envs,
-                    mix, args.seed, sample=False, frozen=frozen))
+                    mix, args.seed, sample=False, frozen=frozen,
+                    pickups=args.pickups))
     if args.both:
         report("采样（训练时优化的那个）",
                evaluate(model, device, args.episodes, args.envs,
-                        mix, args.seed, sample=True, frozen=frozen))
+                        mix, args.seed, sample=True, frozen=frozen,
+                        pickups=args.pickups))
 
 
 if __name__ == "__main__":

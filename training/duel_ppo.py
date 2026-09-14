@@ -447,6 +447,9 @@ def main():
     parser.add_argument("--frozen-from", type=Path, default=None,
                         help="checkpoint driving the pool's frozen slots; "
                              "defaults to --init-from")
+    parser.add_argument("--pickups", action="store_true",
+                        help="spawn weapon crates. Off reproduces the game "
+                             "every published benchmark was measured on")
     parser.add_argument("--threads", type=int, default=0,
                         help="engine worker threads; 0 asks the OS")
     parser.add_argument("--output", type=Path, default=Path("outputs/ppo_duel_v1"))
@@ -523,7 +526,9 @@ def main():
 
     env = DuelVec(config.envs, 1_000_000 + config.seed * 977,
                   (config.laika_weight, config.mpc_weight, config.frozen_weight),
-                  args.threads)
+                  args.threads, pickups=args.pickups)
+    if args.pickups:
+        print("weapon crates: on", flush=True)
     optimiser = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1e-5)
 
     batch = config.envs * config.rollout_steps
