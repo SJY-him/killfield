@@ -16,6 +16,9 @@ use crate::duel_obs::{
     encode, DuelObservation, BULLET_SLOTS, DODGE_DIM, DODGE_OFFSET, OBS_DIM,
     OBS_SCHEMA_VERSION,
 };
+use crate::constants as C;
+use crate::duel_obs::LASER_THREAT_OFFSET;
+use crate::pickups::Weapon;
 use crate::score::{dodge_safety, DODGE_HORIZON};
 use crate::game::Game;
 use crate::rng::Rng;
@@ -41,24 +44,56 @@ struct Slot {
     observation_opponent: DuelObservation,
     last_action: Option<u16>,
     done: bool,
+    /// The weapon the drill hands the opponent, and the round it was last
+    /// handed over on. `setup_battle` builds fresh tanks roughly 55 frames
+    /// after `RoundEnd`, so arming once at construction lasts exactly one
+    /// round; this re-arms whenever the round number moves.
+    drill_weapon: Option<Weapon>,
+    armed_round: i32,
+    /// Frames this round the opponent's beam was lined up on seat 0, and
+    /// whether seat 0's death was a laser. Win rate barely moves on either —
+    /// the point of the drill is to move these.
+    threat_frames: u32,
+    laser_death: bool,
 }
 
 impl Slot {
-    fn new(seed: u32, opponent: Opponent, pickups: bool) -> Self {
+    fn new(seed: u32, opponent: Opponent, pickups: bool,
+           drill_weapon: Option<Weapon>) -> Self {
         let mut game = duel_game(seed, opponent);
         // Set before `DuelState::new`, which reads the arena the round starts
         // with. A slot keeps one `Game` across rounds, so this is the only
         // place the flag has to be applied.
         game.pickups_enabled = pickups;
         let state = DuelState::new(seed, opponent, &game);
-        Slot {
+        let mut slot = Slot {
             game,
             state,
             observation: DuelObservation::default(),
             observation_opponent: DuelObservation::default(),
             last_action: None,
             done: false,
+            drill_weapon,
+            armed_round: -1,
+            threat_frames: 0,
+            laser_death: false,
+        };
+        slot.arm_if_needed();
+        slot
+    }
+
+    /// Hand the drill weapon to the opponent seat. Cheap and idempotent, so it
+    /// is simply called every frame rather than hooked to a round-change event
+    /// that would have to agree with `setup_battle` about when a round starts.
+    fn arm_if_needed(&mut self) {
+        let Some(weapon) = self.drill_weapon else { return };
+        if self.armed_round == self.game.round_number {
+            return;
         }
+        self.armed_round = self.game.round_number;
+        self.game.tanks[1].weapon = weapon;
+        self.game.tanks[1].weapon_charges = weapon.charges().max(1);
+        self.game.tanks[1].fire_cooldown = 0;
     }
 }
 
@@ -70,6 +105,8 @@ struct SlotResult {
     reward: f32,
     fired: u32,
     hit: u32,
+    threat_frames: u32,
+    laser_death: u32,
     outcome: u8,
     frames: u32,
     ended: bool,
@@ -80,6 +117,13 @@ pub struct DuelVecEnv {
     /// Whether crates spawn. Held here because `reset_done` builds fresh slots
     /// and they have to inherit it.
     pickups: bool,
+    /// The laser drill: a weapon handed to the opponent every round, with no
+    /// crates involved. Learning to *use* a crate is an exploration problem
+    /// with almost no gradient — a live tank crosses a crate roughly twice in
+    /// 48,000 frames of random play. Learning to survive what a crate produces
+    /// is not: the threat arrives whether or not the policy goes looking, so
+    /// handing the opponent the weapon directly is both simpler and denser.
+    drill_weapon: Option<Weapon>,
     rng: Rng,
     next_seed: u32,
     /// Worker threads for the per-slot loop. A planner opponent costs ~225 us
@@ -110,6 +154,8 @@ pub struct DuelVecEnv {
     action_changes: Vec<u32>,
     shots: Vec<u32>,
     hits: Vec<u32>,
+    threat_frames: Vec<u32>,
+    laser_deaths: Vec<u32>,
 }
 
 impl DuelVecEnv {
@@ -121,6 +167,7 @@ impl DuelVecEnv {
         frozen_weight: f64,
         threads: usize,
         pickups: bool,
+        drill_weapon: Option<Weapon>,
     ) -> Self {
         let threads = if threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
@@ -137,11 +184,13 @@ impl DuelVecEnv {
         let mut slots = Vec::with_capacity(count);
         for i in 0..count {
             let opponent = draw_opponent(&mut rng, &opponent_cdf);
-            slots.push(Slot::new(base_seed.wrapping_add(i as u32), opponent, pickups));
+            slots.push(Slot::new(base_seed.wrapping_add(i as u32), opponent, pickups,
+                                 drill_weapon));
         }
         let mut env = DuelVecEnv {
             slots,
             pickups,
+            drill_weapon,
             rng,
             next_seed: base_seed.wrapping_add(count as u32),
             threads,
@@ -160,6 +209,8 @@ impl DuelVecEnv {
             action_changes: vec![0; count],
             shots: vec![0; count],
             hits: vec![0; count],
+            threat_frames: vec![0; count],
+            laser_deaths: vec![0; count],
         };
         for i in 0..env.slots.len() {
             env.encode_slot(i);
@@ -298,22 +349,44 @@ impl DuelVecEnv {
                             .copied()
                             .map(|a| a.min(DUEL_ACTIONS as u16 - 1));
                         slot.state.before_step_with(&mut slot.game, supplied);
+                        let alive_before = slot.game.tanks[0].alive;
                         let events = slot.game.step();
+                        // The beam resolves and vanishes inside the frame it is
+                        // fired, so attribution has to happen now: afterwards
+                        // there is no projectile left to blame.
+                        if alive_before && !slot.game.tanks[0].alive
+                            && slot.game.beam.ttl == C::LASER_BEAM_FRAMES
+                            && slot.game.beam.victim == Some(0)
+                        {
+                            slot.laser_death = true;
+                        }
                         let outcome = duel_settle(&slot.game, &mut slot.state, &events);
 
                         // Every ending here is a real one: the frame cap is
                         // itself a draw carrying its own reward, not a
                         // truncation to bootstrap a value estimate through.
                         slot.done = outcome.outcome.terminal();
+                        Self::encode_into_slot(slot);
+                        // Read the threat straight out of the observation the
+                        // policy is about to act on, rather than tracing the
+                        // beam a second time.
+                        if slot.observation.values[LASER_THREAT_OFFSET] > 0.5 {
+                            slot.threat_frames += 1;
+                        }
                         out[k] = SlotResult {
                             reward: outcome.reward as f32,
                             fired: outcome.fired as u32,
                             hit: outcome.hit as u32,
+                            threat_frames: slot.threat_frames,
+                            laser_death: slot.laser_death as u32,
                             outcome: outcome.outcome.as_u8(),
                             frames: slot.state.frames,
                             ended: slot.done,
                         };
-                        Self::encode_into_slot(slot);
+                        if slot.done {
+                            slot.threat_frames = 0;
+                            slot.laser_death = false;
+                        }
                     }
                 });
             }
@@ -323,6 +396,8 @@ impl DuelVecEnv {
             self.rewards[index] = r.reward;
             self.shots[index] = r.fired;
             self.hits[index] = r.hit;
+            self.threat_frames[index] = r.threat_frames;
+            self.laser_deaths[index] = r.laser_death;
             self.outcomes[index] = r.outcome;
             self.dones[index] = r.ended as u8;
             // A slot that was already done contributes no new terminal.
@@ -344,6 +419,7 @@ impl DuelVecEnv {
     /// work is divided.
     pub fn reset_done(&mut self) {
         let pickups = self.pickups;
+        let drill_weapon = self.drill_weapon;
         let pending: Vec<(usize, u32, Opponent)> = (0..self.slots.len())
             .filter(|&i| self.slots[i].done)
             .map(|i| {
@@ -363,7 +439,7 @@ impl DuelVecEnv {
             for (work, out) in pending.chunks(chunk).zip(built.chunks_mut(chunk)) {
                 scope.spawn(move || {
                     for (k, &(_, seed, opponent)) in work.iter().enumerate() {
-                        let mut slot = Slot::new(seed, opponent, pickups);
+                        let mut slot = Slot::new(seed, opponent, pickups, drill_weapon);
                         Self::encode_into_slot(&mut slot);
                         out[k] = Some(slot);
                     }
@@ -396,7 +472,33 @@ pub extern "C" fn kf_duel_new_with_pickups(
     pickups: u32,
 ) -> *mut DuelVecEnv {
     new_env(count, base_seed, laika_permille, mpc_permille, frozen_permille,
-            threads, pickups != 0)
+            threads, pickups != 0, None)
+}
+
+/// Arm the opponent with `drill_weapon` every round, using `Weapon::code`'s
+/// numbering; `0` is no drill. Independent of `pickups`, and the two are not
+/// normally combined: the drill exists precisely so the threat does not have
+/// to be waited for.
+#[no_mangle]
+pub extern "C" fn kf_duel_new_drill(
+    count: u32,
+    base_seed: u32,
+    laika_permille: u32,
+    mpc_permille: u32,
+    frozen_permille: u32,
+    threads: u32,
+    pickups: u32,
+    drill_weapon: u32,
+) -> *mut DuelVecEnv {
+    let weapon = match drill_weapon {
+        1 => Some(Weapon::Gatling),
+        2 => Some(Weapon::Shotgun),
+        3 => Some(Weapon::Shield),
+        4 => Some(Weapon::Laser),
+        _ => None,
+    };
+    new_env(count, base_seed, laika_permille, mpc_permille, frozen_permille,
+            threads, pickups != 0, weapon)
 }
 
 #[no_mangle]
@@ -409,7 +511,7 @@ pub extern "C" fn kf_duel_new(
     threads: u32,
 ) -> *mut DuelVecEnv {
     new_env(count, base_seed, laika_permille, mpc_permille, frozen_permille,
-            threads, false)
+            threads, false, None)
 }
 
 fn new_env(
@@ -420,6 +522,7 @@ fn new_env(
     frozen_permille: u32,
     threads: u32,
     pickups: bool,
+    drill_weapon: Option<Weapon>,
 ) -> *mut DuelVecEnv {
     let count = count.max(1) as usize;
     Box::into_raw(Box::new(DuelVecEnv::new(
@@ -430,6 +533,7 @@ fn new_env(
         frozen_permille as f64,
         threads as usize,
         pickups,
+        drill_weapon,
     )))
 }
 
@@ -495,6 +599,8 @@ pointer_export!(kf_duel_episode_frames, episode_frames, u32);
 pointer_export!(kf_duel_action_changes, action_changes, u32);
 pointer_export!(kf_duel_shots, shots, u32);
 pointer_export!(kf_duel_hits, hits, u32);
+pointer_export!(kf_duel_threat_frames, threat_frames, u32);
+pointer_export!(kf_duel_laser_deaths, laser_deaths, u32);
 
 #[no_mangle]
 pub extern "C" fn kf_duel_obs_dim() -> u32 {
@@ -557,7 +663,7 @@ mod tests {
         // does not tell a finished round from a live one. `terminals` does,
         // and that is what the trainer's GAE cuts the bootstrap on — nothing
         // in the training path infers the end of an episode from the reward.
-        let mut env = DuelVecEnv::new(8, 100, 1.0, 0.0, 0.0, 2, false);
+        let mut env = DuelVecEnv::new(8, 100, 1.0, 0.0, 0.0, 2, false, None);
         let mut rng = Rng::new(1);
         let actions: Vec<u16> = (0..8).map(|_| (rng.random() * 18.0) as u16).collect();
         let mut terminals_seen = 0;
@@ -588,7 +694,7 @@ mod tests {
 
     #[test]
     fn every_episode_reaches_a_real_result() {
-        let mut env = DuelVecEnv::new(16, 7, 1.0, 0.0, 0.0, 4, false);
+        let mut env = DuelVecEnv::new(16, 7, 1.0, 0.0, 0.0, 4, false, None);
         let seen = run(&mut env, 900);
         assert!(!seen.is_empty(), "no episode finished in 900 frames");
         assert!(
@@ -599,7 +705,7 @@ mod tests {
 
     #[test]
     fn the_opponent_mix_is_drawn_per_episode() {
-        let env = DuelVecEnv::new(64, 21, 0.5, 0.5, 0.0, 4, false);
+        let env = DuelVecEnv::new(64, 21, 0.5, 0.5, 0.0, 4, false, None);
         let mpc = env.opponents.iter().filter(|&&o| o == 1).count();
         assert!((8..56).contains(&mpc), "half-and-half produced {mpc}/64 planners");
 
@@ -609,7 +715,7 @@ mod tests {
             ((0.0, 1.0, 0.0), 1),
             ((0.0, 0.0, 1.0), 2),
         ] {
-            let only = DuelVecEnv::new(16, 3, weights.0, weights.1, weights.2, 2, false);
+            let only = DuelVecEnv::new(16, 3, weights.0, weights.1, weights.2, 2, false, None);
             assert!(
                 only.opponents.iter().all(|&o| o == want),
                 "weights {weights:?} produced {:?}",
@@ -621,7 +727,7 @@ mod tests {
     #[test]
     fn a_three_way_pool_lands_near_its_weights() {
         // 40 / 40 / 20 over 512 slots.
-        let env = DuelVecEnv::new(512, 4242, 0.4, 0.4, 0.2, 4, false);
+        let env = DuelVecEnv::new(512, 4242, 0.4, 0.4, 0.2, 4, false, None);
         let share = |k: u8| {
             env.opponents.iter().filter(|&&o| o == k).count() as f64 / 512.0
         };
@@ -636,7 +742,7 @@ mod tests {
 
     #[test]
     fn a_frozen_opponent_publishes_its_own_view_and_plays_what_it_is_given() {
-        let mut env = DuelVecEnv::new(8, 77, 0.0, 0.0, 1.0, 2, false);
+        let mut env = DuelVecEnv::new(8, 77, 0.0, 0.0, 1.0, 2, false, None);
         assert!(env.needs_action.iter().all(|&n| n == 1), "every slot needs an action");
 
         // Its observation must be a real encoding, not a zeroed buffer, and it
@@ -652,7 +758,7 @@ mod tests {
         }
 
         // Driving tank 1 forward must actually move it.
-        let mut env = DuelVecEnv::new(1, 5, 0.0, 0.0, 1.0, 1, false);
+        let mut env = DuelVecEnv::new(1, 5, 0.0, 0.0, 1.0, 1, false, None);
         let before = env.slots[0].game.tanks[1];
         for _ in 0..12 {
             env.step(&[8], &[14]); // [2,1,0]: opponent drives forward
@@ -669,7 +775,7 @@ mod tests {
     fn a_frozen_opponent_with_no_action_supplied_simply_holds_still() {
         // The null-pointer path: the trainer may legitimately have nothing to
         // say on the very first frame.
-        let mut env = DuelVecEnv::new(2, 9, 0.0, 0.0, 1.0, 1, false);
+        let mut env = DuelVecEnv::new(2, 9, 0.0, 0.0, 1.0, 1, false, None);
         let before = env.slots[0].game.tanks[1];
         env.step(&[8, 8], &[]);
         let after = env.slots[0].game.tanks[1];
@@ -678,7 +784,7 @@ mod tests {
 
     #[test]
     fn slots_do_not_share_a_maze() {
-        let env = DuelVecEnv::new(8, 500, 1.0, 0.0, 0.0, 2, false);
+        let env = DuelVecEnv::new(8, 500, 1.0, 0.0, 0.0, 2, false, None);
         let mut shapes = std::collections::HashSet::new();
         for slot in &env.slots {
             shapes.insert(slot.game.maze.cells.clone());
@@ -688,7 +794,7 @@ mod tests {
 
     #[test]
     fn the_observation_buffer_stays_in_range() {
-        let mut env = DuelVecEnv::new(8, 88, 0.75, 0.25, 0.0, 4, false);
+        let mut env = DuelVecEnv::new(8, 88, 0.75, 0.25, 0.0, 4, false, None);
         let mut rng = Rng::new(9);
         for _ in 0..250 {
             let actions: Vec<u16> = (0..8).map(|_| (rng.random() * 18.0) as u16).collect();
@@ -702,7 +808,7 @@ mod tests {
 
     #[test]
     fn a_done_slot_comes_back_with_a_fresh_round() {
-        let mut env = DuelVecEnv::new(4, 1234, 1.0, 0.0, 0.0, 2, false);
+        let mut env = DuelVecEnv::new(4, 1234, 1.0, 0.0, 0.0, 2, false, None);
         let stand_still = vec![8u16; 4];
         for _ in 0..(DUEL_FRAMES + DUEL_GRACE_FRAMES + 10) {
             env.step(&stand_still, &[]);

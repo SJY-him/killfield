@@ -51,8 +51,9 @@ def load(run: Path, device: torch.device) -> tuple[torch.nn.Module, dict]:
 
 @torch.inference_mode()
 def evaluate(model, device, episodes: int, envs: int, weights,
-             seed: int, sample: bool, frozen=None, pickups: bool = False):
-    env = DuelVec(envs, seed, weights, pickups=pickups)
+             seed: int, sample: bool, frozen=None, pickups: bool = False,
+             drill: str = "none"):
+    env = DuelVec(envs, seed, weights, pickups=pickups, drill=drill)
     results = {name: {k: 0 for k in ("win", "loss", "double", "draw")}
                for name in OPPONENT_NAMES.values()}
     frames_seen = []
@@ -63,6 +64,12 @@ def evaluate(model, device, episodes: int, envs: int, weights,
     turn_total = 0
     throttle_reversals = 0
     steps = 0
+    # The drill's two scores. Win rate is useless here — it moves the same
+    # whether or not crates exist — so a run is judged on how often the policy
+    # dies to a beam and how long it spends standing in one.
+    laser_deaths = 0
+    threat_frames = 0
+    episodes_scored = 0
 
     try:
         while sum(sum(r.values()) for r in results.values()) < episodes:
@@ -120,6 +127,10 @@ def evaluate(model, device, episodes: int, envs: int, weights,
                 name = OPPONENT_NAMES[int(env.opponents[i])]
                 results[name][OUTCOME_NAMES[int(env.outcomes[i])]] += 1
                 frames_seen.append(int(env.frames[i]))
+                # Read before reset_done clears the slot's counters.
+                laser_deaths += int(env.laser_deaths[i])
+                threat_frames += int(env.threat_frames[i])
+                episodes_scored += 1
             previous[env.dones.astype(bool)] = -1
             env.reset_done()
     finally:
@@ -134,6 +145,9 @@ def evaluate(model, device, episodes: int, envs: int, weights,
         "turn_reversal_off_target": int(turn_reversals[1]),
         "throttle_reversal_rate": throttle_reversals / max(turn_total, 1),
         "steps": steps,
+        "drill": drill,
+        "laser_death_rate": laser_deaths / max(episodes_scored, 1),
+        "threat_frames_per_episode": threat_frames / max(episodes_scored, 1),
     }
 
 
@@ -151,6 +165,10 @@ def report(label: str, r: dict):
     print(f"  转向反向率      {r['turn_reversal_rate']:>6.1%}  "
           f"（瞄准中 {r['turn_reversal_on_target']} / 未瞄准 {r['turn_reversal_off_target']}）")
     print(f"  油门反向率      {r['throttle_reversal_rate']:>6.1%}")
+    if r.get("drill", "none") != "none":
+        print(f"  —— {r['drill']} 靶场 ——")
+        print(f"  被{r['drill']}打死  {r['laser_death_rate']:>6.1%}  （占全部回合）")
+        print(f"  待在射线上      {r['threat_frames_per_episode']:>6.2f} 帧/回合")
 
 
 def main():
@@ -163,6 +181,10 @@ def main():
     parser.add_argument("--frozen", type=Path, default=None,
                         help="checkpoint driving the frozen slots of the pool")
     parser.add_argument("--seed", type=int, default=9_000)
+    parser.add_argument("--drill", default="none",
+                        choices=("none", "gatling", "shotgun", "shield", "laser"),
+                        help="arm the opponent with this weapon every round, "
+                             "with no crates involved")
     parser.add_argument("--pickups", action="store_true",
                         help="evaluate with weapon crates on. Must match how "
                              "the checkpoint was trained, or the comparison "
@@ -193,12 +215,12 @@ def main():
     report("argmax（网页看到的就是这个）",
            evaluate(model, device, args.episodes, args.envs,
                     mix, args.seed, sample=False, frozen=frozen,
-                    pickups=args.pickups))
+                    pickups=args.pickups, drill=args.drill))
     if args.both:
         report("采样（训练时优化的那个）",
                evaluate(model, device, args.episodes, args.envs,
                         mix, args.seed, sample=True, frozen=frozen,
-                        pickups=args.pickups))
+                        pickups=args.pickups, drill=args.drill))
 
 
 if __name__ == "__main__":

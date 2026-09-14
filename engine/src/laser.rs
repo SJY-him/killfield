@@ -44,6 +44,13 @@ pub struct Beam {
     pub points: Vec<(f64, f64)>,
     /// Frames of afterglow left.
     pub ttl: i32,
+    /// Who fired it, and who it killed. The shot resolves and disappears
+    /// inside one frame, so a caller that wants to attribute a death to a
+    /// laser cannot look for a projectile afterwards — there is none. Recording
+    /// it here is the only way to tell a beam kill from a bullet kill without
+    /// re-deriving the whole trace.
+    pub owner: usize,
+    pub victim: Option<usize>,
 }
 
 impl Beam {
@@ -166,7 +173,7 @@ pub fn trace(game: &Game, tank: usize, rotation: f64) -> Trace {
 /// need but which makes the unit tests read as statements about the weapon.
 pub fn fire(game: &mut Game, tank: usize) -> usize {
     let Trace { points, victim } = trace(game, tank, game.tanks[tank].rotation);
-    game.beam = Beam { points, ttl: C::LASER_BEAM_FRAMES };
+    game.beam = Beam { points, ttl: C::LASER_BEAM_FRAMES, owner: tank, victim };
     let Some(victim) = victim else { return 0 };
     let owner_number = game.tanks[tank].number;
     let victim_number = game.tanks[victim].number;

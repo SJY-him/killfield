@@ -46,6 +46,8 @@ ETA_INDEX = 893
 
 OUTCOME_NAMES = {0: "running", 1: "win", 2: "loss", 3: "double", 4: "draw"}
 OPPONENT_NAMES = {0: "laika", 1: "mpc", 2: "frozen"}
+# `Weapon::code` in engine/src/pickups.rs. 0 means no drill.
+DRILL_WEAPONS = {"none": 0, "gatling": 1, "shotgun": 2, "shield": 3, "laser": 4}
 
 def _default_library() -> Path:
     """cargo names the cdylib per platform; pick the one that is there."""
@@ -63,14 +65,20 @@ DEFAULT_LIBRARY = _default_library()
 class DuelVec:
     def __init__(self, count: int, seed: int, weights=(1.0, 0.0, 0.0),
                  threads: int = 0, library: Path = DEFAULT_LIBRARY,
-                 pickups: bool = False):
+                 pickups: bool = False, drill: str = "none"):
         """`weights` is (laika, mpc, frozen); it is normalised, not required to
         sum to one. A frozen slot publishes tank 1's observation and expects an
         action back — see `obs_opponent` and `needs_action`.
 
         `pickups` turns the weapon crates on. Off by default, because that is
         the game every published benchmark was measured on and the only setting
-        under which a schema-25 checkpoint is comparable to its ancestor."""
+        under which a schema-25 checkpoint is comparable to its ancestor.
+
+        `drill` arms the opponent with a weapon every round, crates not
+        involved. Learning to *use* a crate is an exploration problem with
+        almost no gradient — a live tank crosses one about twice in 48,000
+        frames of random play. Learning to survive what a crate produces is
+        not: the threat arrives whether or not the policy goes looking."""
         self.count = count
         self.lib = ctypes.CDLL(str(Path(library).resolve()))
 
@@ -107,8 +115,8 @@ class DuelVec:
         self.episode_frames = int(self.lib.kf_duel_frames())
         self.grace_frames = int(self.lib.kf_duel_grace_frames())
 
-        self.lib.kf_duel_new_with_pickups.argtypes = [ctypes.c_uint32] * 7
-        self.lib.kf_duel_new_with_pickups.restype = ctypes.c_void_p
+        self.lib.kf_duel_new_drill.argtypes = [ctypes.c_uint32] * 8
+        self.lib.kf_duel_new_drill.restype = ctypes.c_void_p
         self.lib.kf_duel_step.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_uint16),
@@ -122,8 +130,11 @@ class DuelVec:
         self.weights = tuple(w / total for w in weights)
         # threads=0 lets the engine ask the OS how many cores it has.
         self.pickups = bool(pickups)
-        self.handle = self.lib.kf_duel_new_with_pickups(
-            count, seed, *permille, threads, int(self.pickups),
+        if drill not in DRILL_WEAPONS:
+            raise ValueError(f"drill must be one of {sorted(DRILL_WEAPONS)}, got {drill!r}")
+        self.drill = drill
+        self.handle = self.lib.kf_duel_new_drill(
+            count, seed, *permille, threads, int(self.pickups), DRILL_WEAPONS[drill],
         )
 
         self.obs = self._view("kf_duel_obs", ctypes.c_float, (count, OBS_DIM))
@@ -142,6 +153,11 @@ class DuelVec:
         self.action_changes = self._view("kf_duel_action_changes", ctypes.c_uint32, (count,))
         self.shots = self._view("kf_duel_shots", ctypes.c_uint32, (count,))
         self.hits = self._view("kf_duel_hits", ctypes.c_uint32, (count,))
+        # Frames this round the opponent's beam was lined up on the policy, and
+        # whether the policy's death was a laser. Win rate barely moves on
+        # either, which is exactly why the drill is scored on these instead.
+        self.threat_frames = self._view("kf_duel_threat_frames", ctypes.c_uint32, (count,))
+        self.laser_deaths = self._view("kf_duel_laser_deaths", ctypes.c_uint32, (count,))
 
     def _view(self, name, ctype, shape):
         function = getattr(self.lib, name)

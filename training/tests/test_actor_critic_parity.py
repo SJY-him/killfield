@@ -1,15 +1,21 @@
-"""The trainer's ActorCritic must be the deployed network, not merely like it.
+"""The trainer's ActorCritic must still be the deployed network after widening.
 
-`hybrid_web.HybridActor` is a faithful rebuild, but nothing trains it. What
-matters for warm-starting a run is that `duel_ppo.ActorCritic` — the class the
-trainer actually optimises — has the same architecture down to the tensor
-names, so the browser's weights drop into it and produce the same decisions.
+`duel_ppo.ActorCritic` is now schema 25: its scalar head reads 124 inputs where
+the deployed checkpoint has 88, because schema 25 appended 36 channels for the
+weapon crates. Warm-starting therefore goes through `widen_obs.py`, which pads
+that one layer with zero columns.
 
-If it does not, a warm start still *runs*: `load_state_dict(strict=False)`
-would quietly leave half the network at its initialisation and the run would
-look like it was fine-tuning v17b while actually training something else. So
-this checks the thing that failure would break — the logits — rather than
-checking that the load did not raise.
+Two things have to hold and neither raises if it does not.
+
+The weights have to land on the right tensors — a `load_state_dict(strict=False)`
+that silently left half the network at its initialisation would still train,
+and would look like it was fine-tuning v17b while actually training something
+else.
+
+And the padding has to be inert. A zero column contributes nothing, so a
+widened model fed an observation whose new channels are zero — which is exactly
+what the engine produces with crates off — must return the logits the deployed
+model returned. Not close: identical to f32 rounding.
 
     python training/tests/test_actor_critic_parity.py
 """
@@ -25,8 +31,12 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "training"))
 
+import torch.nn as nn  # noqa: E402
+
+from duel_env import OBS_DIM  # noqa: E402
 from duel_ppo import ActorCritic  # noqa: E402
-from hybrid_web import fill_from_export, load_deployed_actor  # noqa: E402
+from hybrid_web import fill_from_export  # noqa: E402
+from widen_obs import OLD_OBS_DIM, OLD_SCALAR_DIM, widen_state_dict  # noqa: E402
 
 WEIGHTS = ROOT / "viewer/assets/hybrid.bin"
 MANIFEST = ROOT / "viewer/assets/hybrid.json"
@@ -41,15 +51,30 @@ def main() -> int:
     dodge = torch.tensor([fixture["dodge"]], dtype=torch.float32)
     expected = torch.tensor([fixture["logits"]], dtype=torch.float32)
 
+    # Same route widen_obs.py takes: build at the old width, fill, widen.
     model = ActorCritic(dodge_gate=True, ammo_gate=True)
     before = model.critic.weight.detach().clone()
+    model.scalars[0] = nn.Linear(OLD_SCALAR_DIM, 128)
     meta = fill_from_export(model, WEIGHTS, MANIFEST, allow_missing=("critic",))
+
+    widened = ActorCritic(dodge_gate=True, ammo_gate=True)
+    widened.critic.load_state_dict(model.critic.state_dict())
+    state, columns = widen_state_dict(model.state_dict())
+    widened.load_state_dict(state)
+    model = widened
     model.eval()
+
+    # The fixture is a schema-24 observation; the appended channels are what
+    # the engine writes with crates off, which is zero.
+    obs = torch.cat((obs, torch.zeros(1, OBS_DIM - OLD_OBS_DIM)), dim=1)
 
     total = sum(p.numel() for p in model.parameters())
     critic_size = model.critic.weight.numel() + model.critic.bias.numel()
     print(f"checkpoint      {meta['checkpoint']} · schema {meta['schema']}")
-    print(f"parameters      {total:,} = export {meta['floats']:,} + critic {critic_size}")
+    print(f"widened         scalars.0: {OLD_SCALAR_DIM} -> {OLD_SCALAR_DIM + columns} "
+          f"inputs ({columns} zero columns)")
+    print(f"parameters      {total:,} = export {meta['floats']:,} + critic {critic_size} "
+          f"+ padding {columns * 128}")
 
     with torch.inference_mode():
         logits, value = model(obs, mask, dodge)
@@ -83,8 +108,9 @@ def main() -> int:
     # An ungated model must refuse the gated export rather than load part of it.
     refused = False
     try:
-        fill_from_export(ActorCritic(dodge_gate=False, ammo_gate=False),
-                         WEIGHTS, MANIFEST, allow_missing=("critic",))
+        narrow = ActorCritic(dodge_gate=False, ammo_gate=False)
+        narrow.scalars[0] = nn.Linear(OLD_SCALAR_DIM, 128)
+        fill_from_export(narrow, WEIGHTS, MANIFEST, allow_missing=("critic",))
     except KeyError:
         refused = True
     print(f"ungated model   refuses the gated export: {refused}")
@@ -93,7 +119,7 @@ def main() -> int:
         explicit_error <= TOLERANCE
         # Not a tolerance: aligned, the two routes are the same arithmetic.
         and slice_error == 0.0
-        and total == meta["floats"] + critic_size
+        and total == meta["floats"] + critic_size + columns * 128
         and int(logits.argmax(1)) == int(fixture["action"])
         and torch.equal(model.critic.weight, before)
         and refused
