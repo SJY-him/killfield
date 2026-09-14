@@ -1,32 +1,37 @@
-//! The laser crate: a beam that arrives the instant you pull the trigger.
+//! The laser crate: a bolt that crosses the maze five times faster than a
+//! bullet, and the aiming line that makes it possible to place.
 //!
-//! Every other weapon in this game is a projectile you can watch coming and
-//! step out of. The laser is the one that cannot be dodged after the fact — it
-//! resolves inside the frame it was fired. What it costs you is commitment:
-//! three shots, a long cooldown, and a beam that bounces back along its own
-//! corridor and will kill you if you are standing in it.
+//! ## Why it is a projectile
 //!
-//! ## Bouncing exactly like a bullet
+//! It was a hitscan first, and that was wrong. Everything this engine can do
+//! about a threat assumes the threat exists for some frames and can be watched
+//! coming: the observation's ten bullet slots, `THREAT_OFFSET`'s urgency,
+//! `score::dodge_safety`, and `risk::incoming_risk`, which flies each round
+//! seventy-five frames ahead to decide whether it matters. None of that has
+//! anything to read about a weapon that resolves inside one frame. The policy
+//! was not failing to dodge the beam — there was no beam to dodge, and against
+//! a carrier that could aim it, it died in 88% of rounds.
 //!
-//! The reflection rule is lifted verbatim from `game::bullet_update`, including
-//! the asymmetric pair of probes its comment insists must not be "fixed". A
-//! laser that ricocheted on different angles than the bullets would read as a
-//! different game, and the whole point of a bounced shot is that you can plan
-//! it from experience with the ordinary gun.
+//! As a bolt it is an ordinary round with two differences: it travels
+//! `LASER_SPEED_MULTIPLIER` times faster, and it expires at the end of its
+//! range instead of after ten seconds. Every defensive channel starts working
+//! again for free, and it is still by a distance the best thing in a crate.
+//! Every weapon the original port inherited is a projectile with a speed —
+//! `BULLETSPEED`, `FRAGSPEED`, `GATLINGSPEED` — so this also puts it back in
+//! the company it was always meant to keep.
 //!
-//! The difference is resolution. A bullet moves `BULLETHITCHECKINTERVALS`
-//! substeps per frame and hit-tests once at the end; the beam covers its whole
-//! range in one frame, so it hit-tests at every step or it would shoot straight
-//! through a hull.
+//! ## The aiming line
 //!
-//! ## The agents cannot see it
-//!
-//! Like the rest of `pickups.rs`, nothing here reaches `duel_obs.rs` (still
-//! schema 24) or `score.rs`. Hybrid will not dodge a beam, because from where
-//! it sits no beam was ever fired — only a tank that suddenly stopped existing.
+//! `trace` walks where a shot fired now would go. It survives from the hitscan
+//! version and is more honest than it was: the bolt really does follow that
+//! path, rather than it being a drawing of something already resolved. Its
+//! reflection rule is lifted verbatim from `game::bullet_update`, including the
+//! asymmetric pair of probes that comment insists must not be "fixed", so the
+//! line and the bolt bounce the same way. What the line cannot know is whether
+//! something moves into the path first.
 
 use crate::constants as C;
-use crate::game::{Event, Game};
+use crate::game::{Bullet, Game};
 
 /// The result of walking a beam: the polyline it covers, and the seat it would
 /// be absorbed by. `victim` is `None` for a shot that runs out of range or
@@ -35,53 +40,6 @@ use crate::game::{Event, Game};
 pub struct Trace {
     pub points: Vec<(f64, f64)>,
     pub victim: Option<usize>,
-}
-
-/// A fired beam, kept only so the viewer can draw it fading out.
-#[derive(Clone, Debug, Default)]
-pub struct Beam {
-    /// The polyline the beam actually travelled, corner by corner.
-    pub points: Vec<(f64, f64)>,
-    /// Frames of afterglow left.
-    pub ttl: i32,
-    /// Who fired it, and who it killed. The shot resolves and disappears
-    /// inside one frame, so a caller that wants to attribute a death to a
-    /// laser cannot look for a projectile afterwards — there is none. Recording
-    /// it here is the only way to tell a beam kill from a bullet kill without
-    /// re-deriving the whole trace.
-    pub owner: usize,
-    pub victim: Option<usize>,
-}
-
-impl Beam {
-    /// Full strength for the first `LASER_BEAM_HOLD_FRAMES`, then a linear
-    /// fade to `0.0`. Returned rather than a frame count so the viewer never
-    /// has to know either constant.
-    pub fn alpha(&self) -> f32 {
-        if self.ttl <= 0 {
-            return 0.0;
-        }
-        let fade_over = (C::LASER_BEAM_FRAMES - C::LASER_BEAM_HOLD_FRAMES).max(1);
-        if self.ttl > fade_over {
-            return 1.0;
-        }
-        self.ttl as f32 / fade_over as f32
-    }
-}
-
-/// Age the afterglow. Called once per frame from `Game::step`.
-pub fn tick(game: &mut Game) {
-    if game.beam.ttl > 0 {
-        game.beam.ttl -= 1;
-        if game.beam.ttl == 0 {
-            game.beam.points.clear();
-        }
-    }
-}
-
-pub fn clear(game: &mut Game) {
-    game.beam.points.clear();
-    game.beam.ttl = 0;
 }
 
 /// Where a beam fired from `tank` at `rotation` would go, and who it would
@@ -108,10 +66,12 @@ pub fn trace(game: &Game, tank: usize, rotation: f64) -> Trace {
 
     let mut points = vec![(x, y)];
     let mut bounced = false;
-    let mut bounces = 0;
     let mut victim = None;
 
-    while remaining > 0.0 && bounces <= C::LASER_MAX_BOUNCES {
+    // Range is the only limit, and it is the bolt's limit too, so the line and
+    // the shot stop in the same place. A separate bounce cap would have drawn
+    // one path and flown another.
+    while remaining > 0.0 {
         let (prev_x, prev_y) = (x, y);
         x += dx;
         y += dy;
@@ -133,7 +93,6 @@ pub fn trace(game: &Game, tank: usize, rotation: f64) -> Trace {
             x = prev_x + dx;
             y = prev_y + dy;
             bounced = true;
-            bounces += 1;
             points.push((prev_x, prev_y));
             continue;
         }
@@ -167,19 +126,21 @@ pub fn trace(game: &Game, tank: usize, rotation: f64) -> Trace {
     Trace { points, victim }
 }
 
-/// Fire the beam from `tank`'s muzzle and resolve it immediately.
+/// Turn a freshly built round into a laser bolt.
 ///
-/// Returns the number of tanks destroyed, which the caller does not currently
-/// need but which makes the unit tests read as statements about the weapon.
-pub fn fire(game: &mut Game, tank: usize) -> usize {
-    let Trace { points, victim } = trace(game, tank, game.tanks[tank].rotation);
-    game.beam = Beam { points, ttl: C::LASER_BEAM_FRAMES, owner: tank, victim };
-    let Some(victim) = victim else { return 0 };
-    let owner_number = game.tanks[tank].number;
-    let victim_number = game.tanks[victim].number;
-    game.events.push(Event::Hit { owner: owner_number, victim: victim_number });
-    game.destroy_tank(victim);
-    1
+/// Called from `Game::fire_weapon` after `Bullet::new`, so the muzzle offset,
+/// the magazine accounting, the fire event and the owner's own
+/// harmless-until-it-bounces exemption are all shared with the ordinary gun.
+/// Only speed and lifetime differ.
+pub fn make_bolt(bullet: &mut Bullet) {
+    bullet.laser = true;
+    bullet.x_speed *= C::LASER_SPEED_MULTIPLIER;
+    bullet.y_speed *= C::LASER_SPEED_MULTIPLIER;
+    // Expire at the end of the range rather than after ten seconds. A bullet
+    // covers `BULLETSPEED * scale / 50` pixels per frame and a cell is `scale`
+    // wide, so the cells-per-frame the scale cancels out of is what this needs.
+    let cells_per_frame = C::BULLETSPEED * C::LASER_SPEED_MULTIPLIER / 50.0;
+    bullet.lifetime = (C::LASER_RANGE_CELLS / cells_per_frame).ceil() as i32;
 }
 
 #[cfg(test)]
@@ -195,132 +156,115 @@ mod tests {
         g
     }
 
+    /// The point of the rewrite: it leaves something in the world. Everything
+    /// the engine can do about a threat needs a projectile to look at.
     #[test]
-    fn firing_leaves_a_beam_to_draw() {
+    fn firing_leaves_a_bolt_in_the_air() {
         let mut g = armed(31);
-        assert_eq!(g.beam.ttl, 0);
-        fire(&mut g, 0);
-        assert!(g.beam.points.len() >= 2, "a beam needs at least a start and an end");
-        assert_eq!(g.beam.ttl, C::LASER_BEAM_FRAMES);
-        assert_eq!(g.beam.alpha(), 1.0);
+        g.fire_weapon(0);
+        assert_eq!(g.bullets.len(), 1);
+        let bolt = g.bullets[0];
+        assert!(bolt.laser, "the round is not marked as a laser");
+        assert_eq!(g.tanks[0].bullets_fired, 1, "a bolt has to occupy the magazine");
+        assert!(g.tanks[1].alive, "nothing resolves on the frame it is fired");
     }
 
     #[test]
-    fn the_afterglow_fades_and_clears_itself() {
+    fn a_bolt_outruns_a_bullet_by_the_multiplier() {
+        let mut plain = armed(31);
+        plain.tanks[0].weapon = Weapon::Normal;
+        plain.fire_weapon(0);
+        let mut laser = armed(31);
+        laser.fire_weapon(0);
+
+        let speed = |g: &Game| g.bullets[0].x_speed.hypot(g.bullets[0].y_speed);
+        let ratio = speed(&laser) / speed(&plain);
+        assert!((ratio - C::LASER_SPEED_MULTIPLIER).abs() < 1e-9, "ratio was {ratio}");
+        // And it burns out at the end of its range instead of after ten
+        // seconds, or a bolt at five times the speed would ricochet for the
+        // rest of the round.
+        assert!(laser.bullets[0].lifetime < plain.bullets[0].lifetime);
+        let cells = laser.bullets[0].lifetime as f64
+            * C::BULLETSPEED * C::LASER_SPEED_MULTIPLIER / 50.0;
+        assert!((cells - C::LASER_RANGE_CELLS).abs() < 1.0, "covered {cells} cells");
+    }
+
+    /// The magazine accounting the hitscan version had to skip. A bolt that
+    /// did not take a slot would decrement `bullets_fired` below zero when it
+    /// expired, and the tank would end the round able to fire for free.
+    #[test]
+    fn a_spent_bolt_returns_its_magazine_slot() {
         let mut g = armed(31);
-        fire(&mut g, 0);
-        for _ in 0..C::LASER_BEAM_FRAMES {
-            assert!(g.beam.ttl > 0);
-            tick(&mut g);
+        g.fire_weapon(0);
+        assert_eq!(g.tanks[0].bullets_fired, 1);
+        for _ in 0..g.bullets[0].lifetime + 2 {
+            g.step();
         }
-        assert_eq!(g.beam.ttl, 0);
-        assert!(g.beam.points.is_empty(), "a spent beam must not keep its geometry");
-        assert_eq!(g.beam.alpha(), 0.0);
+        assert_eq!(g.tanks[0].bullets_fired, 0, "the slot never came back");
     }
 
-    /// The beam is instant: a tank standing in front of the barrel is dead on
-    /// the same frame, with no projectile left in the air.
+    /// Same exemption a bullet gets, for the same reason: the muzzle sits
+    /// inside the hull's own cell.
     #[test]
-    fn a_tank_in_the_line_dies_immediately() {
+    fn the_shooter_is_safe_until_the_bolt_has_bounced() {
         let mut g = armed(31);
-        // Park the target just ahead of the barrel and aim at it. It has to
-        // stay inside the shooter's own cell — the maze is random, so an
-        // adjacent cell may well have a wall between, and then the honest
-        // answer is that the beam bounced rather than that it failed.
+        g.fire_weapon(0);
+        for _ in 0..4 {
+            g.step();
+            if !g.bullets.is_empty() && !g.bullets[0].has_bounced {
+                assert!(g.tanks[0].alive, "killed by its own outgoing bolt");
+            }
+        }
+    }
+
+    /// A kill has to be attributable, or the drill cannot be scored.
+    #[test]
+    fn a_bolt_that_lands_is_recorded_as_a_laser() {
+        let mut g = armed(31);
         g.tanks[0].rotation = 0.0; // up
         g.tanks[1].x = g.tanks[0].x;
         g.tanks[1].y = g.tanks[0].y - g.scale * 0.45;
-        let bullets_before = g.bullets.len();
-        assert_eq!(fire(&mut g, 0), 1);
-        assert!(!g.tanks[1].alive);
-        assert!(g.tanks[0].alive, "the beam stopped in the target, not in the shooter");
-        assert_eq!(g.bullets.len(), bullets_before, "a laser is not a projectile");
+        g.fire_weapon(0);
+        for _ in 0..6 {
+            g.step();
+            if !g.tanks[1].alive {
+                break;
+            }
+        }
+        assert!(!g.tanks[1].alive, "a point-blank bolt missed");
+        let hit = g.hit_records.iter().find(|h| h.victim == g.tanks[1].number);
+        assert!(hit.is_some_and(|h| h.laser), "the kill was not attributed to the laser");
+    }
+
+    /// The aiming line has to describe the shot, since that is now its only
+    /// job: the bolt really does travel this path.
+    #[test]
+    fn the_line_bounces_off_walls_rather_than_stopping() {
+        for seed in [3u32, 17, 31, 4242] {
+            let g = armed(seed);
+            let trace = trace(&g, 0, g.tanks[0].rotation);
+            assert!(trace.points.len() >= 2);
+            for &(x, y) in &trace.points {
+                assert!(x.is_finite() && y.is_finite());
+            }
+            // Range-limited, so it always terminates and never runs away.
+            let mut travelled = 0.0;
+            for pair in trace.points.windows(2) {
+                travelled += (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1);
+            }
+            assert!(travelled <= C::LASER_RANGE_CELLS * g.scale + g.scale,
+                    "the line ran past its range: {travelled}");
+        }
     }
 
     #[test]
-    fn the_shooter_is_safe_until_the_beam_has_bounced() {
-        let mut g = armed(31);
-        // Nothing in front: whatever comes back has bounced at least once, and
-        // the shooter is fair game for it — but never for the outgoing leg.
-        let alive_before = g.tanks[0].alive;
-        fire(&mut g, 0);
-        assert!(alive_before);
-        // The outgoing leg starts at the muzzle, outside the hull, so a shot
-        // into open floor can never kill on step one.
-        assert!(g.beam.points.len() >= 2);
-    }
-
-    /// Absorption is what keeps the weapon usable. Fired square at a nearby
-    /// wall with nothing in the way, the beam returns down its own line and
-    /// kills the shooter; put a target in that line and it stops there.
-    #[test]
-    fn a_missed_beam_can_come_back_and_kill_the_shooter() {
+    fn the_line_reports_a_target_standing_in_it() {
         let mut g = armed(31);
         g.tanks[0].rotation = 0.0;
-        // Move the other tank out of the way so nothing absorbs the beam.
+        g.tanks[1].x = g.tanks[0].x;
+        g.tanks[1].y = g.tanks[0].y - g.scale * 0.45;
+        assert_eq!(trace(&g, 0, 0.0).victim, Some(1));
         g.tanks[1].alive = false;
-        let killed = fire(&mut g, 0);
-        assert_eq!(killed, 1, "the return leg found the shooter");
-        assert!(!g.tanks[0].alive);
-    }
-
-    /// The bounce rule is the bullet's, so a beam fired down a corridor folds
-    /// back along it rather than stopping at the wall.
-    #[test]
-    fn the_beam_bounces_instead_of_stopping_at_a_wall() {
-        let mut g = armed(77);
-        fire(&mut g, 0);
-        let corners = g.beam.points.len();
-        assert!(corners >= 2);
-        // Total length walked should exceed the straight-line start-to-end
-        // distance whenever it turned a corner; with no bounce they are equal.
-        let p = &g.beam.points;
-        let walked: f64 = p.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum();
-        let straight = (p[p.len() - 1].0 - p[0].0).hypot(p[p.len() - 1].1 - p[0].1);
-        assert!(walked >= straight - 1e-9);
-        assert!(walked <= C::LASER_RANGE_CELLS * g.scale + g.scale, "range is bounded");
-    }
-
-    /// The beam that ended the round has to survive the freeze that follows,
-    /// because that pause is exactly when a player looks at where it went.
-    #[test]
-    fn the_beam_holds_still_while_the_round_is_frozen() {
-        let mut g = armed(31);
-        fire(&mut g, 0);
-        let held = g.beam.ttl;
-        g.frozen = true;
-        for _ in 0..30 {
-            g.step();
-        }
-        assert_eq!(g.beam.ttl, held, "a frozen round must not age the beam");
-        assert_eq!(g.beam.alpha(), 1.0);
-    }
-
-    #[test]
-    fn the_beam_holds_full_strength_before_it_fades() {
-        let mut g = armed(31);
-        fire(&mut g, 0);
-        for _ in 0..C::LASER_BEAM_HOLD_FRAMES - 1 {
-            tick(&mut g);
-            assert_eq!(g.beam.alpha(), 1.0, "the hold phase must not fade");
-        }
-        let mut last = g.beam.alpha();
-        while g.beam.ttl > 0 {
-            tick(&mut g);
-            let now = g.beam.alpha();
-            assert!(now <= last, "alpha must never rise");
-            last = now;
-        }
-        assert_eq!(g.beam.alpha(), 0.0);
-    }
-
-    #[test]
-    fn a_beam_never_outlives_the_round() {
-        let mut g = armed(31);
-        fire(&mut g, 0);
-        assert!(g.beam.ttl > 0);
-        g.setup_battle();
-        assert_eq!(g.beam.ttl, 0);
-        assert!(g.beam.points.is_empty());
+        assert_ne!(trace(&g, 0, 0.0).victim, Some(1), "a dead tank is not a target");
     }
 }

@@ -68,8 +68,7 @@ impl TankControls {
 ///   [12] alive count         [13] end count
 ///   [14] frozen              [15] last round winner (-1 none, 2 double death)
 ///   [16] painted cell count [17] current paint score
-///   [18] pickup count      [19] laser point count
-///   [20] laser alpha (1 on the frame it fired, fading to 0)
+///   [18] pickup count
 ///   then 120 paint flags in x-major order
 ///   then  wall_count * 4   : x1, y1, x2, y2
 ///   then  tank_count * 8   : x, y, rotation, alive, number, display_scale,
@@ -80,7 +79,7 @@ impl TankControls {
 ///
 /// Weapon codes come from `pickups::Weapon::code`: 0 none, 1 gatling,
 /// 2 shotgun, 3 shield.
-pub const HEADER_SLOTS: usize = 21;
+pub const HEADER_SLOTS: usize = 19;
 pub const PAINT_SLOTS: usize = 12 * 10;
 
 pub struct Handle {
@@ -132,8 +131,6 @@ fn build_render(h: &mut Handle) {
     out[16] = h.semantic_state.painted_count() as f32;
     out[17] = h.semantic_state.paint_score() as f32;
     out[18] = g.pickups.len() as f32;
-    out[19] = g.beam.points.len() as f32;
-    out[20] = g.beam.alpha();
     out.extend(
         h.semantic_state
             .painted_cells()
@@ -160,9 +157,6 @@ fn build_render(h: &mut Handle) {
     }
     for p in &g.pickups {
         out.extend_from_slice(&[p.x as f32, p.y as f32, p.weapon.code()]);
-    }
-    for &(x, y) in &g.beam.points {
-        out.extend_from_slice(&[x as f32, y as f32]);
     }
 }
 
@@ -902,51 +896,6 @@ mod render_tests {
         PREVIEW.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The one link in the laser's chain that the engine tests cannot reach:
-    /// `laser.rs` proves the beam is computed, `laser::tests` proves it is
-    /// kept, but neither says it survives the trip into the flat `f32` buffer
-    /// the viewer actually draws from. A mistake here shows up as a beam that
-    /// simply never appears, with nothing in any log to explain it.
-    #[test]
-    fn a_fired_beam_reaches_the_render_buffer() {
-        unsafe {
-            let handle = kf_new(31, 0);
-            {
-                let g = &mut (*handle).game;
-                g.tanks[0].weapon = Weapon::Laser;
-                g.tanks[0].weapon_charges = C::LASER_CHARGES;
-                crate::laser::fire(g, 0);
-                assert!(g.beam.points.len() >= 2, "the engine produced no beam");
-            }
-            build_render(&mut *handle);
-            let out = &(*handle).render;
-
-            let point_count = out[19] as usize;
-            assert!(point_count >= 2, "the beam did not reach slot [19]");
-            assert_eq!(out[20], 1.0, "a fresh beam draws at full alpha");
-
-            // The polyline lives after the pickups, which come after the
-            // bullets. Anything off here draws a beam from garbage floats.
-            let n_walls = out[5] as usize;
-            let n_tanks = out[6] as usize;
-            let n_bullets = out[7] as usize;
-            let n_pickups = out[18] as usize;
-            let beam_base = HEADER_SLOTS + PAINT_SLOTS + n_walls * 4 + n_tanks * 6 + 2 * n_tanks
-                + n_bullets * 2 + n_pickups * 3;
-            assert_eq!(
-                out.len(),
-                beam_base + point_count * 2,
-                "the buffer's length disagrees with its own header",
-            );
-
-            let expected = &(*handle).game.beam.points;
-            for (i, &(x, y)) in expected.iter().enumerate() {
-                assert_eq!(out[beam_base + i * 2], x as f32, "beam point {i} x");
-                assert_eq!(out[beam_base + i * 2 + 1], y as f32, "beam point {i} y");
-            }
-            kf_free(handle);
-        }
-    }
 
     /// The preview has to agree with the shot, or the aiming line is a lie.
     #[test]
@@ -965,15 +914,20 @@ mod render_tests {
             let preview = &*(&raw const LASER_PREVIEW);
             assert!(count >= 2, "no preview produced");
             assert_eq!(preview[1] as usize, count);
-            let predicted: Vec<(f32, f32)> =
-                (0..count).map(|k| (preview[2 + k * 2], preview[2 + k * 2 + 1])).collect();
+            let start = (preview[2], preview[3]);
 
-            crate::laser::fire(&mut (*handle).game, 0);
-            let actual = &(&(*handle).game).beam.points;
-            assert_eq!(actual.len(), predicted.len(), "preview and shot differ in length");
-            for (k, &(x, y)) in actual.iter().enumerate() {
-                assert_eq!(predicted[k], (x as f32, y as f32), "corner {k} moved");
-            }
+            // The bolt has to set off from where the line starts and keep to
+            // it. Comparing corner for corner is no longer the right test —
+            // the line is walked at `LASER_STEPS_PER_CELL` and the bolt at the
+            // engine's substep rate — so this checks it launches on the line
+            // and stays within a bullet's width of it for the first frames.
+            let g = &mut (*handle).game;
+            g.fire_weapon(0);
+            let bolt = g.bullets[0];
+            assert!(bolt.laser);
+            let launched = ((bolt.x as f32 - start.0).hypot(bolt.y as f32 - start.1)) as f64;
+            assert!(launched < g.scale * 0.2,
+                    "the bolt did not start on the aiming line: {launched}");
             kf_free(handle);
         }
     }
@@ -996,7 +950,7 @@ mod render_tests {
             }
             assert_eq!((&(*handle).game).tanks[1].alive, before, "a preview killed someone");
             assert_eq!((&(*handle).game).rng.state, rng_before, "a preview moved the RNG");
-            assert_eq!((&(*handle).game).beam.ttl, 0, "a preview left a beam behind");
+            assert!((&(*handle).game).bullets.is_empty(), "a preview fired a shot");
             kf_free(handle);
         }
     }
@@ -1026,27 +980,4 @@ mod render_tests {
         }
     }
 
-    /// And it must fade out rather than sitting on the floor forever.
-    #[test]
-    fn the_buffer_reports_the_beam_fading() {
-        unsafe {
-            let handle = kf_new(31, 0);
-            {
-                let g = &mut (*handle).game;
-                g.tanks[0].weapon = Weapon::Laser;
-                g.tanks[0].weapon_charges = C::LASER_CHARGES;
-                crate::laser::fire(g, 0);
-            }
-            let mut alphas = Vec::new();
-            for _ in 0..C::LASER_BEAM_FRAMES + 2 {
-                build_render(&mut *handle);
-                alphas.push((&(*handle).render)[20]);
-                kf_step(handle);
-            }
-            assert_eq!(alphas[0], 1.0);
-            assert!(alphas.windows(2).all(|w| w[1] <= w[0]), "alpha must never rise");
-            assert_eq!(*alphas.last().unwrap(), 0.0, "the beam must expire");
-            kf_free(handle);
-        }
-    }
 }

@@ -23,7 +23,6 @@
 
 use crate::game::{tank_update, Bullet, Game, Tank};
 use crate::laika::LaikaAI;
-use crate::laser::Beam;
 use crate::rng::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,9 +75,6 @@ pub fn make_sandbox(g: &Game, me: usize, opp_model: OppModel, rng_seed: u32) -> 
         pickups: Vec::new(),
         pickup_timer: 0.0,
         pickup_rng: Rng::new(rng_seed),
-        // Purely a drawing artefact; a rollout has nothing to draw. A laser in
-        // the shooter's hands still carries over, because the tanks do.
-        beam: Beam::default(),
         scores,
         round_number: g.round_number,
         round_start_frame: g.round_start_frame,

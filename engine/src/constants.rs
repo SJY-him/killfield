@@ -60,12 +60,29 @@ pub const GATLING_CHARGES: i32 = 24;
 pub const GATLING_COOLDOWN_FRAMES: i32 = 2;
 pub const GATLING_MAX_IN_FLIGHT: i32 = 12;
 
-/// Laser: shots per pickup, wall bounces, range in cells, how finely the beam
+/// The laser is a projectile, not a hitscan.
+///
+/// It began as an instant beam and that was a mistake. Every defensive
+/// mechanism this engine has assumes a threat that exists in the world for
+/// some number of frames and can therefore be seen coming: the observation's
+/// ten bullet slots, `THREAT_OFFSET`'s urgency, `score::dodge_safety`, and
+/// `risk::incoming_risk`, which flies each round forward seventy-five frames
+/// to decide whether it is a danger. All 113 of those channels read "clear"
+/// against a weapon that resolves inside the frame it is fired. The policy was
+/// not failing to dodge it; there was nothing there to dodge, and measured
+/// against a competent carrier it died in 88% of rounds.
+///
+/// Every weapon the original port inherited is a projectile with a speed —
+/// `BULLETSPEED`, `FRAGSPEED`, `GATLINGSPEED`. A bolt travelling five times a
+/// bullet's speed is still overwhelmingly the best thing in a crate, and it
+/// costs nothing to defend against that the engine did not already have.
+pub const LASER_SPEED_MULTIPLIER: f64 = 5.0;
+
+/// Laser: shots per pickup, range in cells, how finely the aiming preview
 /// is marched, and how long the afterglow is drawn for. The cooldown is long
 /// on purpose — an instant, undodgeable hit has to be rationed.
 pub const LASER_CHARGES: i32 = 3;
 pub const LASER_COOLDOWN_FRAMES: i32 = 12;
-pub const LASER_MAX_BOUNCES: i32 = 3;
 pub const LASER_RANGE_CELLS: f64 = 14.0;
 /// March resolution. A hull is about a third of a cell across, so sixteen
 /// steps per cell puts five or so tests inside one — enough that the beam

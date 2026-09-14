@@ -16,7 +16,6 @@ use crate::duel_obs::{
     encode, DuelObservation, BULLET_SLOTS, DODGE_DIM, DODGE_OFFSET, OBS_DIM,
     OBS_SCHEMA_VERSION,
 };
-use crate::constants as C;
 use crate::duel_obs::LASER_THREAT_OFFSET;
 use crate::pickups::Weapon;
 use crate::score::{dodge_safety, DODGE_HORIZON};
@@ -349,15 +348,13 @@ impl DuelVecEnv {
                             .copied()
                             .map(|a| a.min(DUEL_ACTIONS as u16 - 1));
                         slot.state.before_step_with(&mut slot.game, supplied);
-                        let alive_before = slot.game.tanks[0].alive;
                         let events = slot.game.step();
-                        // The beam resolves and vanishes inside the frame it is
-                        // fired, so attribution has to happen now: afterwards
-                        // there is no projectile left to blame.
-                        if alive_before && !slot.game.tanks[0].alive
-                            && slot.game.beam.ttl == C::LASER_BEAM_FRAMES
-                            && slot.game.beam.victim == Some(0)
-                        {
+                        // `HitRecord` says which round landed on whom, so a
+                        // laser kill is read off the shot rather than guessed
+                        // at from what is left in the air afterwards.
+                        if slot.game.hit_records.iter().any(|hit| {
+                            hit.laser && hit.victim == slot.game.tanks[0].number
+                        }) {
                             slot.laser_death = true;
                         }
                         let outcome = duel_settle(&slot.game, &mut slot.state, &events);

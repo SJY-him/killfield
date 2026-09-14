@@ -80,7 +80,7 @@ const POLICY_PILOT_STEPS_PER_FRAME = 64;
 // Render buffer layout, matching engine/src/wasm.rs's build_render() doc
 // comment: 18 header slots, then 120 paint flags (unused here — killfield has
 // no paint mechanic), then wall_count*4, tank_count*6, bullet_count*2.
-const HEADER_SLOTS = 21;   // engine/src/wasm.rs; [18..20] pickups + laser
+const HEADER_SLOTS = 19;   // engine/src/wasm.rs; [18] is the pickup count
 const TANK_SLOTS = 8;      // x, y, rotation, alive, number, scale, weapon, shield
 const PICKUP_SLOTS = 3;    // x, y, weapon
 const PAINT_SLOTS = 12 * 10;
@@ -400,35 +400,6 @@ function drawLaserPreview(ctx, preview, ox, oy, scale) {
 }
 
 /**
- * The laser's afterglow: the polyline the beam actually travelled, drawn as a
- * hot core inside a wider halo, fading over `LASER_BEAM_FRAMES`. The engine
- * hands over an alpha rather than a frame count, so the fade lives in one place.
- */
-function drawBeam(ctx, buf, base, pointCount, alpha, ox, oy, scale) {
-  if (pointCount < 2 || !(alpha > 0)) return;
-  ctx.save();
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-  const trace = () => {
-    ctx.beginPath();
-    ctx.moveTo(ox + buf[base], oy + buf[base + 1]);
-    for (let i = 1; i < pointCount; i += 1) {
-      ctx.lineTo(ox + buf[base + i * 2], oy + buf[base + i * 2 + 1]);
-    }
-    ctx.stroke();
-  };
-  ctx.globalAlpha = alpha * 0.3;
-  ctx.strokeStyle = THEME.laserHalo;
-  ctx.lineWidth = Math.max(3, scale * 0.16);
-  trace();
-  ctx.globalAlpha = alpha;
-  ctx.strokeStyle = THEME.laserCore;
-  ctx.lineWidth = Math.max(1.2, scale * 0.045);
-  trace();
-  ctx.restore();
-}
-
-/**
  * A crate on the floor. The glyph inside says which weapon without needing a
  * legend: three bars for the gatling's rate of fire, a fan for the shotgun's
  * spread, an arc for the shield, a bolt for the laser.
@@ -577,10 +548,6 @@ function draw(buf, colors, previous, alpha, localPlayer = null, aimOverlay = nul
   }
 
   drawLaserPreview(ctx, laserPreview, ox, oy, scale);
-
-  // The laser sits above the floor but below the hulls, so a beam that ends
-  // in a tank reads as stopping at it rather than crossing it.
-  drawBeam(ctx, buf, pickupBase + (buf[18] | 0) * PICKUP_SLOTS, buf[19] | 0, buf[20], ox, oy, scale);
 
   // Crates go under the tanks: driving onto one should read as covering it.
   const nPickups = buf[18] | 0;
@@ -1379,7 +1346,7 @@ function toggleLanguage() {
 
 async function boot() {
   const [wasmBytes, hybrid] = await Promise.all([
-    fetch("kf_engine.wasm?v=d9df06c2").then((res) => res.arrayBuffer()),
+    fetch("kf_engine.wasm?v=adda8323").then((res) => res.arrayBuffer()),
     HybridPolicy.load("assets/hybrid.json?v=a1ab1f63", "assets/hybrid.bin?v=96169340"),
   ]);
   // Hashed before instantiation so a record names the exact binaries it is

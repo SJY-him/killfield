@@ -10,7 +10,7 @@
 //! ~200-byte POD out and back is cheaper than any aliasing workaround.
 
 use crate::constants as C;
-use crate::laser::{self, Beam};
+use crate::laser;
 use crate::pickups::{self, Pickup, Weapon};
 use crate::laika::{laika_step, LaikaAI};
 use crate::maze::{
@@ -101,6 +101,9 @@ pub struct HitRecord {
     pub owner: usize,
     pub victim: usize,
     pub has_bounced: bool,
+    /// Whether the round that landed was a laser bolt. The drill is scored on
+    /// this, and a bolt is indistinguishable from a bullet once it is gone.
+    pub laser: bool,
 }
 
 impl Event {
@@ -433,6 +436,11 @@ pub struct Bullet {
     /// A bullet is harmless to whoever fired it until it has bounced at least
     /// once. That is the actual rule, not a workaround for the muzzle overlap.
     pub has_bounced: bool,
+    /// A laser bolt: an ordinary round in every respect except that it travels
+    /// `LASER_SPEED_MULTIPLIER` times faster and expires at the end of its
+    /// range rather than after ten seconds. Carried so a kill can be
+    /// attributed to the weapon that made it.
+    pub laser: bool,
     /// Set on range-curriculum barrage bullets. They are owned by the target so
     /// the observation reads them as hostile, but a shooting range whose own
     /// barrage destroys the targets makes no sense — so they pass through it.
@@ -459,6 +467,7 @@ impl Bullet {
             removed: false,
             just_created: false,
             has_bounced: false,
+            laser: false,
             injected: false,
         }
     }
@@ -493,8 +502,6 @@ pub struct Game {
     pub pickups: Vec<Pickup>,
     pub pickup_timer: f64,
     pub pickup_rng: Rng,
-    /// The last laser shot, kept only long enough to draw it. See `laser.rs`.
-    pub beam: Beam,
 
     pub scores: Vec<i32>,
     pub round_number: i32,
@@ -570,7 +577,6 @@ impl Game {
             pickups: Vec::new(),
             pickup_timer: 0.0,
             pickup_rng: pickups::new_rng(seed),
-            beam: Beam::default(),
             scores: vec![0; tanks],
             round_number: 0,
             frame: 0,
@@ -652,7 +658,6 @@ impl Game {
         // Fresh tanks already carry the default loadout; this clears the floor
         // and rerolls the crate clock for the new maze's size.
         pickups::reset_round(self);
-        laser::clear(self);
 
         self.alive_count = tanks_n as i32;
 
@@ -742,18 +747,15 @@ impl Game {
     }
 
     pub fn fire_weapon(&mut self, tank: usize) {
-        // The laser resolves inside this call instead of leaving a projectile,
-        // so it never touches `bullet_depth` or the magazine.
-        if self.tanks[tank].weapon == Weapon::Laser {
-            laser::fire(self, tank);
-            self.round_shots_fired[tank] += 1;
-            self.events.push(Event::Fire(self.tanks[tank].number));
-            pickups::note_shot(self, tank);
-            return;
-        }
         self.bullet_depth += 1;
         let b = Bullet::new(self.bullet_depth, tank, &self.tanks[tank], self.scale);
         let mut b = b;
+        // A laser goes down the ordinary projectile path — magazine accounting
+        // included, which the hitscan version had to skip and which both the
+        // hit and the expiry paths decrement. Only speed and range differ.
+        if self.tanks[tank].weapon == Weapon::Laser {
+            laser::make_bolt(&mut b);
+        }
         // Flash gave a freshly attached clip its first frame event on the NEXT
         // tick, so a bullet does not move on the frame it was fired.
         b.just_created = true;
@@ -938,7 +940,6 @@ impl Game {
             }
             pickups::tick_spawn(self);
             pickups::collect(self);
-            laser::tick(self);
         }
         if !self.frozen && self.crate_timer <= 0.0 {
             self.crate_timer = C::CRATESPAWNTIMEBASE
@@ -1194,6 +1195,7 @@ pub fn bullet_update(g: &mut Game, idx: usize) {
                     owner: owner_number,
                     victim: victim_number,
                     has_bounced: b.has_bounced,
+                    laser: b.laser,
                 });
                 g.tanks[b.owner].bullets_fired -= 1;
                 g.destroy_tank(i);
