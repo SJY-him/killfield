@@ -1,11 +1,17 @@
 """Rebuild the deployed Hybrid actor in PyTorch from the files the browser loads.
 
-The checkpoint the viewer ships (`viewer/assets/hybrid.bin` + `hybrid.json`) is
-schema 24 with gated dodge/ammo heads. The training code that produced it was
-never published: `upstream/rl`'s tip is schema 20, 1010 dims, and its
-`ppo_models.py` contains no `dodge_delta`, `ammo_delta` or
-`idle_logit_penalty` at all. So there is no `ActorCritic` in this repository
-that can load `v17b_gs_league_u352.pt`, and nothing to continue training from.
+This was written to recover v17b, the schema-24 checkpoint the fork inherited,
+because the code that produced it was never published: `upstream/rl`'s tip is
+schema 20, 1010 dims, and its `ppo_models.py` contains no `dodge_delta`,
+`ammo_delta` or `idle_logit_penalty` at all. There was no `ActorCritic` in the
+repository that could load `v17b_gs_league_u352.pt`, and nothing to continue
+training from.
+
+It still earns its place now that the viewer ships a checkpoint this repository
+trained itself: it is the independent reading of the exported files, so
+`tests/test_hybrid_web.py` can hold the export against `hybrid.js` without
+either of them going through `duel_ppo.ActorCritic`. The width comes from the
+manifest, so a schema bump does not strand it.
 
 What *is* published is the forward pass itself. `viewer/src/hybrid.js` is a
 complete, exact reimplementation of it — the author measured it against
@@ -59,14 +65,18 @@ BULLET_OFFSET = 900
 BULLET_SLOTS = 10
 BULLET_DIM = 10
 BULLET_BLOCK = BULLET_SLOTS * BULLET_DIM  # 100
-OBS_DIM = 1028
 ACTIONS = 18
+# The width the deployed checkpoint happens to be at. Read from the manifest
+# rather than assumed: this file's whole job is to reconstruct whatever the
+# browser currently ships, so it has to survive a schema bump. Only the tail
+# ever moves — the grid and the bullet rows keep their offsets.
+DEFAULT_OBS_DIM = 1064   # schema 25
 
-# The scalar head reads everything that is neither the map grid nor the bullet
-# rows: the gap between them, then the tail past them.
-SCALAR_HEAD = BULLET_OFFSET - MAP_DIM               # 60
-SCALAR_TAIL = OBS_DIM - BULLET_OFFSET - BULLET_BLOCK  # 28
-SCALAR_DIM = SCALAR_HEAD + SCALAR_TAIL              # 88
+
+def scalar_dim(obs_dim: int) -> int:
+    """What `scalars.0` reads: everything that is neither grid nor bullets —
+    the gap between them, then the tail past them."""
+    return (BULLET_OFFSET - MAP_DIM) + (obs_dim - BULLET_OFFSET - BULLET_BLOCK)
 
 # Individual observation slots the fire gate reads directly. These indices are
 # hardcoded in hybrid.js too; they are the ammo fraction, the predicted-hit
@@ -84,7 +94,7 @@ DEFAULT_PARITY = Path("viewer/assets/hybrid-parity.json")
 
 
 class HybridActor(nn.Module):
-    """The deployed actor: schema 24, 1028 observations, 18 actions.
+    """The deployed actor, built at whatever width the manifest declares.
 
     Only the gated form is built. The exporter can emit an ungated checkpoint
     (flat `dodge_scale` / `ammo_scale` scalars instead of residual gates), but
@@ -93,8 +103,9 @@ class HybridActor(nn.Module):
     that leaves half the architecture at its initialisation.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, obs_dim: int = DEFAULT_OBS_DIM) -> None:
         super().__init__()
+        self.obs_dim = obs_dim
         # Sequential indices are load-bearing: they are the tensor names.
         self.map = nn.Sequential(
             nn.Conv2d(MAP_C, 16, 3, stride=1, padding=1),   # 0
@@ -109,7 +120,7 @@ class HybridActor(nn.Module):
             nn.Linear(BULLET_DIM, 32), nn.ReLU(),           # 0, 1
             nn.Linear(32, 32), nn.ReLU(),                   # 2, 3
         )
-        self.scalars = nn.Sequential(nn.Linear(SCALAR_DIM, 128), nn.Tanh())
+        self.scalars = nn.Sequential(nn.Linear(scalar_dim(obs_dim), 128), nn.Tanh())
         self.trunk = nn.Sequential(nn.Linear(128 + 128 + 32 + 32, 256), nn.Tanh())
         self.actor = nn.Linear(256, ACTIONS)
 
@@ -240,11 +251,8 @@ def fill_from_export(model: nn.Module, weights: Path, manifest: Path,
     warns about.
     """
     meta = json.loads(Path(manifest).read_text())
-    if meta["schema"] != 24 or meta["observation"] != OBS_DIM or meta["actions"] != ACTIONS:
-        raise ValueError(
-            f"manifest is schema {meta['schema']}/{meta['observation']}/{meta['actions']}, "
-            f"not 24/{OBS_DIM}/{ACTIONS}"
-        )
+    if meta["actions"] != ACTIONS:
+        raise ValueError(f"manifest declares {meta['actions']} actions, not {ACTIONS}")
     gated = meta.get("gated", {})
     if not (gated.get("dodge") and gated.get("ammo")):
         raise ValueError(
@@ -286,11 +294,8 @@ def load_deployed_actor(
 ) -> DeployedActor:
     """Build the actor and fill it from the flat blob the browser downloads."""
     meta = json.loads(Path(manifest).read_text())
-    if meta["schema"] != 24 or meta["observation"] != OBS_DIM or meta["actions"] != ACTIONS:
-        raise ValueError(
-            f"manifest is schema {meta['schema']}/{meta['observation']}/{meta['actions']}, "
-            f"not 24/{OBS_DIM}/{ACTIONS}"
-        )
+    if meta["actions"] != ACTIONS:
+        raise ValueError(f"manifest declares {meta['actions']} actions, not {ACTIONS}")
     gated = meta.get("gated", {})
     if not (gated.get("dodge") and gated.get("ammo")):
         raise ValueError(
@@ -302,7 +307,7 @@ def load_deployed_actor(
     if blob.size != meta["floats"]:
         raise ValueError(f"{weights} holds {blob.size} floats, manifest says {meta['floats']}")
 
-    model = HybridActor()
+    model = HybridActor(meta["observation"])
     state = model.state_dict()
     loaded = {}
     for name, spec in meta["tensors"].items():

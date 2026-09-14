@@ -348,6 +348,8 @@ def save_live(output: Path, model, config: Config, steps: int, update: int, star
 
     manifest = {
         "arch": ARCH,
+        "dodge_gate": bool(model.dodge_gate),
+        "ammo_gate": bool(model.ammo_gate),
         "schema_version": OBS_SCHEMA_VERSION,
         "obs_dim": OBS_DIM,
         "bullet_slots": BULLET_SLOTS,
@@ -807,8 +809,21 @@ def main():
         "schedule_steps": schedule_steps,
         "seconds": time.perf_counter() - started,
         "config": asdict(config),
+        # Architecture, not statistics. `export_hybrid_web.py` has to rebuild
+        # this exact network to read the weights, and constructing the wrong
+        # one does not fail loudly: `load_state_dict` takes the tensors it
+        # recognises and leaves the rest at their initialisation. A checkpoint
+        # that does not say what it is invites exactly that.
+        "obs_schema": OBS_SCHEMA_VERSION,
+        "obs_dim": OBS_DIM,
+        "dodge_gate": bool(model.dodge_gate),
+        "ammo_gate": bool(model.ammo_gate),
+        "drill": args.drill,
+        "pickups": bool(args.pickups),
     }
     (output / "complete.json").write_text(json.dumps(result, indent=2))
+    # Beside the weights under the name the exporter looks for.
+    (output / "final.json").write_text(json.dumps(result, indent=2))
     torch.save({"model": model.state_dict(), "arch": ARCH, "result": result},
                output / "final.pt")
     if args.save_every:

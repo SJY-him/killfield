@@ -24,7 +24,16 @@ export const NEUTRAL_ACTION = 8; // stationary, no fire
 export const FPS = 25;
 export const KILLFIELD_RAYS = 512;
 export const OPPONENT_SEAT = 0;
-export const HYBRID_OBS_DIM = 1028;
+/** The observation contract, in one place.
+ *
+ * These used to be written out separately in opponent.js, hybrid.js and
+ * viewer.js. Bumping the schema meant finding all three, and missing one did
+ * not fail where the stale copy was — the page threw "Hybrid observation
+ * layout mismatch between engine and viewer" from whichever check ran first.
+ * Mirrored from engine/src/duel_obs.rs; the engine's own reported values are
+ * what they are checked against at startup. */
+export const HYBRID_OBS_SCHEMA = 25;
+export const HYBRID_OBS_DIM = 1064;
 export const HYBRID_BULLET_SLOTS = 10;
 export const HYBRID_DODGE_OFFSET = 1018;
 export const HYBRID_DODGE_DIM = 9;

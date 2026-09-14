@@ -890,6 +890,17 @@ mod render_tests {
     use super::*;
     use crate::constants as C;
     use crate::pickups::Weapon;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// `kf_laser_preview` writes a process-global buffer, which is fine in the
+    /// browser — wasm is single threaded — but the test harness is not. Three
+    /// tests here read that buffer back, and without this they race and fail
+    /// only sometimes, which is worse than failing always.
+    static PREVIEW: Mutex<()> = Mutex::new(());
+
+    fn preview_lock() -> MutexGuard<'static, ()> {
+        PREVIEW.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// The one link in the laser's chain that the engine tests cannot reach:
     /// `laser.rs` proves the beam is computed, `laser::tests` proves it is
@@ -940,6 +951,7 @@ mod render_tests {
     /// The preview has to agree with the shot, or the aiming line is a lie.
     #[test]
     fn the_preview_matches_the_shot_it_predicts() {
+        let _serialised = preview_lock();
         unsafe {
             let handle = kf_new(31, 0);
             {
@@ -969,6 +981,7 @@ mod render_tests {
     /// And it must change nothing: it is called every drawn frame.
     #[test]
     fn previewing_does_not_touch_the_game() {
+        let _serialised = preview_lock();
         unsafe {
             let handle = kf_new(31, 0);
             {
@@ -991,6 +1004,7 @@ mod render_tests {
     /// And it must say whether the shot connects, so the line can show it.
     #[test]
     fn the_preview_reports_a_connecting_shot() {
+        let _serialised = preview_lock();
         unsafe {
             let handle = kf_new(31, 0);
             let g = &mut (*handle).game;

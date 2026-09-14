@@ -58,6 +58,19 @@ def main() -> None:
     # same place serve_live.py/eval_duel.py read it from.
     manifest_sidecar = args.checkpoint.with_suffix(".json")
     side = json.loads(manifest_sidecar.read_text()) if manifest_sidecar.exists() else {}
+    # Newer checkpoints carry their architecture inside the payload as well, so
+    # fall back to that before defaulting. Defaulting is the dangerous branch:
+    # `ActorCritic()` with no arguments builds the ungated network, which for a
+    # gated checkpoint either KeyErrors or, worse, loads the half it recognises.
+    inner = payload.get("result", {}) or {}
+    if "dodge_gate" not in side and "dodge_gate" in inner:
+        side = {**inner, **side}
+    if "dodge_gate" not in side:
+        raise SystemExit(
+            f"{args.checkpoint} does not say whether it is gated, and neither does "
+            f"{manifest_sidecar}. Refusing to guess: the wrong architecture loads "
+            "silently and exports a network that is half its initialisation."
+        )
     dodge_gate = bool(side.get("dodge_gate", False))
     ammo_gate = bool(side.get("ammo_gate", False))
     model = ActorCritic(
@@ -95,7 +108,7 @@ def main() -> None:
     manifest = {
         "format": "killfield-hybrid-f32-v1",
         "checkpoint": args.checkpoint.name,
-        "schema": int(result.get("obs_schema", 24)),
+        "schema": int(result.get("obs_schema", side.get("obs_schema", 24))),
         "observation": OBS_DIM,
         "bullet_slots": BULLET_SLOTS,
         "actions": 18,

@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "training"))
 
 from hybrid_web import (  # noqa: E402
-    AMMO_INDEX, BULLET_SLOTS, ETA_INDEX, HIT_INDEX, IDLE_STREAK_INDEX, OBS_DIM,
+    AMMO_INDEX, BULLET_SLOTS, ETA_INDEX, HIT_INDEX, IDLE_STREAK_INDEX,
     SUICIDE_INDEX, load_deployed_actor,
 )
 
@@ -37,12 +37,12 @@ from hybrid_web import (  # noqa: E402
 TOLERANCE = 2e-5
 
 
-def build_cases(rng: np.random.Generator) -> list[dict]:
+def build_cases(rng: np.random.Generator, obs_dim: int) -> list[dict]:
     """Random observations, plus the mask and gate corners worth pinning."""
     cases: list[dict] = []
 
     def case(mask: list[bool], obs: np.ndarray | None = None) -> dict:
-        values = rng.uniform(-1, 1, size=OBS_DIM).astype(np.float32) if obs is None else obs
+        values = rng.uniform(-1, 1, size=obs_dim).astype(np.float32) if obs is None else obs
         return {
             "obs": values.tolist(),
             "mask": [bool(m) for m in mask],
@@ -66,7 +66,7 @@ def build_cases(rng: np.random.Generator) -> list[dict]:
         (0.5, 1.0, 0.0, 0.0, 0.32),
         (0.0, 0.0, 1.0, 0.9, 1.0),
     ):
-        obs = rng.uniform(-1, 1, size=OBS_DIM).astype(np.float32)
+        obs = rng.uniform(-1, 1, size=obs_dim).astype(np.float32)
         obs[AMMO_INDEX], obs[HIT_INDEX] = ammo, hit
         obs[SUICIDE_INDEX], obs[ETA_INDEX] = suicide, eta
         obs[IDLE_STREAK_INDEX] = idle
@@ -106,7 +106,7 @@ def main() -> int:
         return 1
 
     rng = np.random.default_rng(20260914)
-    cases = build_cases(rng)
+    cases = build_cases(rng, actor.model.obs_dim)
     expected = browser_logits(cases)
 
     obs = torch.tensor([c["obs"] for c in cases], dtype=torch.float32)

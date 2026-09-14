@@ -24,14 +24,14 @@
  *     ray count (512, always) are not user-facing.
  */
 
-import * as C from "./src/constants.js?v=36d17ebd";
-import { STRINGS, loadLang, saveLang } from "./src/i18n.js?v=36d17ebd";
-import { Keyboard, TouchControls } from "./src/input.js?v=36d17ebd";
-import { AIM_MODE_AIM, AIM_MODE_DRIVE, AIM_MODE_OFF, MouseAim } from "./src/mouse-aim.js?v=36d17ebd";
-import { SoundEffects } from "./src/audio.js?v=36d17ebd";
-import { Rng } from "./src/rng.js?v=36d17ebd";
-import { interpolatePredictedPose, simulationBudget } from "./src/low-latency.js?v=36d17ebd";
-import { HybridPolicy } from "./src/hybrid.js?v=36d17ebd";
+import * as C from "./src/constants.js?v=a85417b0";
+import { STRINGS, loadLang, saveLang } from "./src/i18n.js?v=a85417b0";
+import { Keyboard, TouchControls } from "./src/input.js?v=a85417b0";
+import { AIM_MODE_AIM, AIM_MODE_DRIVE, AIM_MODE_OFF, MouseAim } from "./src/mouse-aim.js?v=a85417b0";
+import { SoundEffects } from "./src/audio.js?v=a85417b0";
+import { Rng } from "./src/rng.js?v=a85417b0";
+import { interpolatePredictedPose, simulationBudget } from "./src/low-latency.js?v=a85417b0";
+import { HybridPolicy } from "./src/hybrid.js?v=a85417b0";
 /** Play mode always seats the human in tank 1. */
 const HUMAN_SEAT = 1;
 // engine/src/duel_obs.rs: the Hybrid observation is schema 24, 1028 semantic
@@ -39,11 +39,12 @@ const HUMAN_SEAT = 1;
 import {
   HYBRID_BULLET_SLOTS,
   HYBRID_OBS_DIM,
+  HYBRID_OBS_SCHEMA,
   KILLFIELD_RAYS,
   OpponentDriver,
   policyActionToInput,
   readObservation,
-} from "./src/opponent.js?v=36d17ebd";
+} from "./src/opponent.js?v=a85417b0";
 
 const STEP_MS = 1000 / C.FPS; // 40 ms
 const MAX_CATCHUP_MS = 250;
@@ -1364,8 +1365,8 @@ function toggleLanguage() {
 
 async function boot() {
   const [wasmBytes, hybrid] = await Promise.all([
-    fetch("kf_engine.wasm?v=db4128fa").then((res) => res.arrayBuffer()),
-    HybridPolicy.load("assets/hybrid.json?v=e23a108d", "assets/hybrid.bin?v=96d48cdf"),
+    fetch("kf_engine.wasm?v=d9df06c2").then((res) => res.arrayBuffer()),
+    HybridPolicy.load("assets/hybrid.json?v=a1ab1f63", "assets/hybrid.bin?v=96169340"),
   ]);
   // Hashed before instantiation so a record names the exact binaries it is
   // reproducible against, rather than a version string someone could bump.
@@ -1373,7 +1374,8 @@ async function boot() {
   wasm = wasmResult.instance.exports;
   hybridPolicy = hybrid;
   scratchPtr = wasm.kf_scratch_ptr();
-  if (wasm.kf_hybrid_schema_version() !== 24 || wasm.kf_hybrid_observation_len() !== HYBRID_OBS_DIM + HYBRID_BULLET_SLOTS) {
+  if (wasm.kf_hybrid_schema_version() !== HYBRID_OBS_SCHEMA
+      || wasm.kf_hybrid_observation_len() !== HYBRID_OBS_DIM + HYBRID_BULLET_SLOTS) {
     throw new Error("Hybrid observation layout mismatch between engine and viewer");
   }
   initialiseThemedPickers();
