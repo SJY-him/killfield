@@ -1139,13 +1139,61 @@ pub fn tank_update(g: &mut Game, idx: usize) {
     }
 }
 
+/// The per-substep hit test a laser bolt needs. Returns true once something
+/// has been hit and the bolt is spent.
+///
+/// An ordinary round moves about a tenth of a tank's width per substep and can
+/// afford a single test at the end of the frame. A bolt covers the same
+/// distance per substep — that is the whole reason it takes more of them
+/// rather than bigger ones — but it takes so many that testing once at the end
+/// would let it pass clean through a hull between frames. The body is the same
+/// rule as the end-of-frame test, including the shooter's exemption while the
+/// bolt has yet to bounce.
+fn laser_hit_test(g: &mut Game, b: &mut Bullet) -> bool {
+    if b.deadly != 0 {
+        return false;
+    }
+    for i in 0..g.tanks_count {
+        if i == b.owner && !b.has_bounced {
+            continue;
+        }
+        if g.tanks[i].alive && g.tanks[i].point_in_shape(b.x, b.y) {
+            let owner_number = g.tanks[b.owner].number;
+            let victim_number = g.tanks[i].number;
+            g.events.push(Event::Hit { owner: owner_number, victim: victim_number });
+            g.hit_records.push(HitRecord {
+                bullet_id: b.id,
+                owner: owner_number,
+                victim: victim_number,
+                has_bounced: b.has_bounced,
+                laser: true,
+            });
+            g.tanks[b.owner].bullets_fired -= 1;
+            g.destroy_tank(i);
+            b.removed = true;
+            return true;
+        }
+    }
+    false
+}
+
 pub fn bullet_update(g: &mut Game, idx: usize) {
     if g.frozen {
         return;
     }
     let mut b = g.bullets[idx];
 
-    for _ in 0..C::BULLETHITCHECKINTERVALS {
+    // A bolt is faster because it takes more substeps, not longer ones. Making
+    // the steps longer instead was the first attempt and it tunnelled: at
+    // twenty-five times a bullet's speed each step was wider than a tank, so
+    // shots passed through their target without a hit ever being tested.
+    let substeps = if b.laser {
+        C::BULLETHITCHECKINTERVALS * C::LASER_SPEED_MULTIPLIER as i32
+    } else {
+        C::BULLETHITCHECKINTERVALS
+    };
+
+    for _ in 0..substeps {
         let prev_x = b.x;
         let prev_y = b.y;
         b.x += b.x_speed;
@@ -1168,12 +1216,15 @@ pub fn bullet_update(g: &mut Game, idx: usize) {
             b.x = prev_x + b.x_speed;
             b.y = prev_y + b.y_speed;
         }
+        if b.laser && laser_hit_test(g, &mut b) {
+            break;
+        }
     }
 
-    // One hit test per frame, after all substeps. The tank that fired is exempt
-    // only while the bullet has not bounced; once it has, it kills its owner
-    // same as anyone. The JS loop does not break, so one bullet can kill both.
-    if b.deadly == 0 {
+    // One hit test per frame for an ordinary round, after all substeps. A
+    // laser has already tested at every substep — see `laser_hit_test` — and a
+    // second pass here would let it kill twice.
+    if b.deadly == 0 && !b.laser {
         for i in 0..g.tanks_count {
             if i == b.owner && !b.has_bounced {
                 continue;

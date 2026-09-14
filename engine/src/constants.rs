@@ -76,7 +76,7 @@ pub const GATLING_MAX_IN_FLIGHT: i32 = 12;
 /// `BULLETSPEED`, `FRAGSPEED`, `GATLINGSPEED`. A bolt travelling five times a
 /// bullet's speed is still overwhelmingly the best thing in a crate, and it
 /// costs nothing to defend against that the engine did not already have.
-pub const LASER_SPEED_MULTIPLIER: f64 = 5.0;
+pub const LASER_SPEED_MULTIPLIER: f64 = 25.0;
 
 /// Laser: shots per pickup, range in cells, how finely the aiming preview
 /// is marched, and how long the afterglow is drawn for. The cooldown is long

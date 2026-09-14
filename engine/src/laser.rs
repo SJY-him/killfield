@@ -133,9 +133,11 @@ pub fn trace(game: &Game, tank: usize, rotation: f64) -> Trace {
 /// harmless-until-it-bounces exemption are all shared with the ordinary gun.
 /// Only speed and lifetime differ.
 pub fn make_bolt(bullet: &mut Bullet) {
+    // Speed is deliberately left alone. `bullet_update` gives a bolt
+    // `LASER_SPEED_MULTIPLIER` times as many substeps instead, so it covers
+    // the same ground per step as an ordinary round and collides just as
+    // accurately. Scaling the step size instead made it pass through tanks.
     bullet.laser = true;
-    bullet.x_speed *= C::LASER_SPEED_MULTIPLIER;
-    bullet.y_speed *= C::LASER_SPEED_MULTIPLIER;
     // Expire at the end of the range rather than after ten seconds. A bullet
     // covers `BULLETSPEED * scale / 50` pixels per frame and a cell is `scale`
     // wide, so the cells-per-frame the scale cancels out of is what this needs.
@@ -171,22 +173,55 @@ mod tests {
 
     #[test]
     fn a_bolt_outruns_a_bullet_by_the_multiplier() {
+        // Measured as ground covered in a frame, not as `x_speed`: a bolt is
+        // fast because it takes more substeps, so its per-step speed is
+        // deliberately identical to a bullet's.
+        let travelled = |normal: bool| {
+            let mut g = armed(31);
+            if normal {
+                g.tanks[0].weapon = Weapon::Normal;
+            }
+            g.fire_weapon(0);
+            // A round does not move on the frame it is fired, so let that one
+            // pass before measuring.
+            g.step();
+            let (x0, y0) = (g.bullets[0].x, g.bullets[0].y);
+            g.step();
+            let b = g.bullets[0];
+            (b.x - x0).hypot(b.y - y0)
+        };
+        let plain = travelled(true);
+        let bolt = travelled(false);
+        assert!(plain > 0.0, "the ordinary round did not move");
+
+        // Straight-line displacement, so a bounce inside the measured frame
+        // shortens it — the bolt covers its full path either way. A wide band
+        // is the honest assertion here; the exact figure is a property of the
+        // maze this seed drew, not of the weapon.
+        let ratio = bolt / plain;
+        assert!(ratio > C::LASER_SPEED_MULTIPLIER * 0.6,
+                "a bolt covered only {ratio}x a bullet's ground");
+        assert!(ratio <= C::LASER_SPEED_MULTIPLIER + 0.5,
+                "a bolt outran its own multiplier: {ratio}x");
+    }
+
+    /// It burns out at the end of its range instead of after ten seconds, or a
+    /// bolt this fast would ricochet for the rest of the round.
+    #[test]
+    fn a_bolt_expires_at_the_end_of_its_range() {
+        let mut laser = armed(31);
+        laser.fire_weapon(0);
         let mut plain = armed(31);
         plain.tanks[0].weapon = Weapon::Normal;
         plain.fire_weapon(0);
-        let mut laser = armed(31);
-        laser.fire_weapon(0);
-
-        let speed = |g: &Game| g.bullets[0].x_speed.hypot(g.bullets[0].y_speed);
-        let ratio = speed(&laser) / speed(&plain);
-        assert!((ratio - C::LASER_SPEED_MULTIPLIER).abs() < 1e-9, "ratio was {ratio}");
-        // And it burns out at the end of its range instead of after ten
-        // seconds, or a bolt at five times the speed would ricochet for the
-        // rest of the round.
         assert!(laser.bullets[0].lifetime < plain.bullets[0].lifetime);
-        let cells = laser.bullets[0].lifetime as f64
-            * C::BULLETSPEED * C::LASER_SPEED_MULTIPLIER / 50.0;
-        assert!((cells - C::LASER_RANGE_CELLS).abs() < 1.0, "covered {cells} cells");
+        // The lifetime is whole frames and rounds up, so the reach is the
+        // range plus up to one frame of travel.
+        let per_frame = C::BULLETSPEED * C::LASER_SPEED_MULTIPLIER / 50.0;
+        let cells = laser.bullets[0].lifetime as f64 * per_frame;
+        assert!(cells >= C::LASER_RANGE_CELLS, "falls {cells} cells short of its range");
+        assert!(cells < C::LASER_RANGE_CELLS + per_frame,
+                "overshoots its range by more than a frame: {cells} cells");
     }
 
     /// The magazine accounting the hitscan version had to skip. A bolt that

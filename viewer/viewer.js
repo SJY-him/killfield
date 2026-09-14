@@ -1346,7 +1346,7 @@ function toggleLanguage() {
 
 async function boot() {
   const [wasmBytes, hybrid] = await Promise.all([
-    fetch("kf_engine.wasm?v=adda8323").then((res) => res.arrayBuffer()),
+    fetch("kf_engine.wasm?v=f2fee6b8").then((res) => res.arrayBuffer()),
     HybridPolicy.load("assets/hybrid.json?v=a1ab1f63", "assets/hybrid.bin?v=96169340"),
   ]);
   // Hashed before instantiation so a record names the exact binaries it is
