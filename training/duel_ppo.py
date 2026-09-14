@@ -385,6 +385,26 @@ class Tally:
         self.counts = {name: [0, 0, 0, 0] for name in self.NAMES}  # win/loss/double/draw
         self.frames = []
         self.change_rates = []
+        # The drill's scores. Win rate cannot see a weapon at all — with crates
+        # on or off, v17b measures the same figures to the digit — so a drill
+        # run is judged on how often the policy dies to the beam and how long
+        # it spends standing in one.
+        self.beam_deaths = 0
+        self.beam_frames = 0
+        self.drill_rounds = 0
+
+    def record_drill(self, laser_death: int, threat_frames: int):
+        self.beam_deaths += laser_death
+        self.beam_frames += threat_frames
+        self.drill_rounds += 1
+
+    @property
+    def beam_death_rate(self):
+        return self.beam_deaths / self.drill_rounds if self.drill_rounds else None
+
+    @property
+    def beam_frames_per_round(self):
+        return self.beam_frames / self.drill_rounds if self.drill_rounds else None
 
     def record(self, outcome: int, opponent: int, frames: int, changes: int):
         row = self.counts[OPPONENT_NAMES[min(opponent, 2)]]
@@ -450,6 +470,13 @@ def main():
     parser.add_argument("--pickups", action="store_true",
                         help="spawn weapon crates. Off reproduces the game "
                              "every published benchmark was measured on")
+    parser.add_argument("--drill", default="none",
+                        choices=("none", "gatling", "shotgun", "shield", "laser"),
+                        help="arm the opponent with this weapon every round, "
+                             "no crates involved. Learning to survive a weapon "
+                             "is a reactive problem; learning to go and fetch "
+                             "one is an exploration problem with almost no "
+                             "gradient")
     parser.add_argument("--threads", type=int, default=0,
                         help="engine worker threads; 0 asks the OS")
     parser.add_argument("--output", type=Path, default=Path("outputs/ppo_duel_v1"))
@@ -526,9 +553,11 @@ def main():
 
     env = DuelVec(config.envs, 1_000_000 + config.seed * 977,
                   (config.laika_weight, config.mpc_weight, config.frozen_weight),
-                  args.threads, pickups=args.pickups)
+                  args.threads, pickups=args.pickups, drill=args.drill)
     if args.pickups:
         print("weapon crates: on", flush=True)
+    if args.drill != "none":
+        print(f"drill: the opponent carries a {args.drill} every round", flush=True)
     optimiser = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1e-5)
 
     batch = config.envs * config.rollout_steps
@@ -625,6 +654,10 @@ def main():
                 for i in np.flatnonzero(env.terminals):
                     tally.record(int(env.outcomes[i]), int(env.opponents[i]),
                                  int(env.frames[i]), int(env.action_changes[i]))
+                    if args.drill != "none":
+                        # Read before reset_done clears the slot's counters.
+                        tally.record_drill(int(env.laser_deaths[i]),
+                                           int(env.threat_frames[i]))
                 env.reset_done()
             obs_t, mask_t = tensors(env, device)
             _, last_value = model(obs_t, mask_t)
@@ -738,6 +771,9 @@ def main():
         with metrics_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
 
+        record["beam_death_rate"] = tally.beam_death_rate
+        record["beam_frames_per_round"] = tally.beam_frames_per_round
+
         rate = lambda side: (
             "—" if record[side]["win_rate"] is None
             else f"{record[side]['win_rate']:.0%}({record[side]['rounds']})"
@@ -749,6 +785,9 @@ def main():
             + (f"chg={record['change_rate']:.0%} " if record["change_rate"] else "")
             + f"EV={explained:+.2f} H={record['entropy']:.2f} "
             + f"KL={record['approx_kl']:.4f} clip={record['clipfrac']:.1%}"
+            + ("" if record["beam_death_rate"] is None else
+               f" beam_kills={record['beam_death_rate']:.0%}"
+               f" in_beam={record['beam_frames_per_round']:.1f}f")
             + (" [critic warmup]" if critic_only else ""),
             flush=True,
         )
