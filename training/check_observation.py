@@ -9,9 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from ppo_models import (
-    ACTION_OFFSET, BULLET_DIM, BULLET_OFFSET, BULLET_SLOTS, MAP_DIM, OBS_DIM,
-    OBS_SCHEMA_VERSION, OPPONENT_OFFSET, PHASE_OFFSET, SELF_OFFSET,
-    MOVEMENT_ACTIONS, FIRE_ACTIONS,
+    ACTION_COUNT, ACTION_OFFSET, BULLET_DIM, BULLET_OFFSET, BULLET_SLOTS, MAP_DIM, NAV_OFFSET, OBS_DIM,
+    OBS_SCHEMA_VERSION, OPPONENT_OFFSET, PHASE_OFFSET, SELF_OFFSET, TIME_OFFSET,
 )
 
 
@@ -44,10 +43,11 @@ def main():
     require("finite", np.isfinite(obs).all(), "observation contains NaN or Inf")
     binary_columns = np.r_[
         np.arange(MAP_DIM),
+        np.arange(NAV_OFFSET, NAV_OFFSET + 4),
         np.arange(SELF_OFFSET + 5, SELF_OFFSET + 9),
         [OPPONENT_OFFSET + 5],
         np.arange(PHASE_OFFSET, PHASE_OFFSET + 3),
-        np.arange(ACTION_OFFSET, ACTION_OFFSET + MOVEMENT_ACTIONS + FIRE_ACTIONS),
+        np.arange(ACTION_OFFSET, ACTION_OFFSET + ACTION_COUNT),
     ]
     binary = obs[:, binary_columns]
     require("binary_channels", np.isin(binary, (0.0, 1.0)).all(), "binary value outside {0,1}")
@@ -56,20 +56,16 @@ def main():
                     & (obs[:, SELF_OFFSET:SELF_OFFSET + 2] <= 1.0)).all(),
         "self position outside [0,1]",
     )
-    path_upper_bound = (12 * 10 - 1) / (12 + 10)
+    navigation = obs[:, NAV_OFFSET:SELF_OFFSET]
     require(
-        "path_length_bound",
-        ((obs[:, MAP_DIM] >= 0.0) & (obs[:, MAP_DIM] <= path_upper_bound + 1e-6)).all(),
-        f"path exceeds analytic bound {path_upper_bound:.6g}",
+        "navigation_direction",
+        np.isin(navigation[:, :4].sum(1), (0.0, 1.0)).all(),
+        "next-path direction is not empty/one-hot",
     )
-    if obs[:, MAP_DIM].max() > 1.0:
-        warnings.append({
-            "check": "path_not_unit_normalized",
-            "detail": (
-                f"empirical max {obs[:, MAP_DIM].max():.6g}; frozen schema divides by 22, "
-                f"analytic bound is {path_upper_bound:.6g}"
-            ),
-        })
+    path_upper_bound = (12 * 10 - 1) / (12 + 10)
+    require("path_cells_bound", ((navigation[:, 4] >= 0.0)
+            & (navigation[:, 4] <= path_upper_bound + 1e-6)).all(),
+            f"remaining path cells exceed analytic bound {path_upper_bound:.6g}")
     require(
         "opponent_relative", np.abs(obs[:, OPPONENT_OFFSET:OPPONENT_OFFSET + 2]).max() <= 2**0.5 + 1e-5,
         "opponent local position exceeds geometric sqrt(2) bound",
@@ -78,14 +74,15 @@ def main():
         "phase_one_hot", np.allclose(obs[:, PHASE_OFFSET:PHASE_OFFSET + 3].sum(1), 1.0),
         "phase is not exactly one-hot",
     )
-    movement_sum = obs[:, ACTION_OFFSET:ACTION_OFFSET + MOVEMENT_ACTIONS].sum(1)
-    fire_sum = obs[:, ACTION_OFFSET + MOVEMENT_ACTIONS:].sum(1)
+    require(
+        "time_range", ((obs[:, TIME_OFFSET] >= 0.0) & (obs[:, TIME_OFFSET] <= 1.0)).all(),
+        "elapsed time is outside [0,1]",
+    )
+    action_sum = obs[:, ACTION_OFFSET:].sum(1)
     require(
         "previous_action",
-        (np.isin(movement_sum, (0.0, 1.0))
-         & np.isin(fire_sum, (0.0, 1.0))
-         & (movement_sum == fire_sum)).all(),
-        "previous Movement/Fire is not empty/one-hot",
+        np.isin(action_sum, (0.0, 1.0)).all(),
+        "previous Discrete(722) action is not empty/one-hot",
     )
 
     bullets = obs[:, BULLET_OFFSET:PHASE_OFFSET].reshape(-1, BULLET_SLOTS, BULLET_DIM)
@@ -102,11 +99,12 @@ def main():
 
     groups = {
         "map": obs[:, :MAP_DIM],
-        "path_length": obs[:, MAP_DIM:SELF_OFFSET],
+        "navigation_direction_and_cells": obs[:, NAV_OFFSET:SELF_OFFSET],
         "self": obs[:, SELF_OFFSET:OPPONENT_OFFSET],
         "opponent": obs[:, OPPONENT_OFFSET:BULLET_OFFSET],
         "bullets_active": bullets[masks] if masks.any() else np.zeros((1, BULLET_DIM), np.float32),
-        "phase": obs[:, PHASE_OFFSET:ACTION_OFFSET],
+        "phase": obs[:, PHASE_OFFSET:TIME_OFFSET],
+        "time": obs[:, TIME_OFFSET:ACTION_OFFSET],
         "previous_action": obs[:, ACTION_OFFSET:],
     }
     report = {

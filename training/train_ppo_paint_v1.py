@@ -1,4 +1,4 @@
-"""PPO paint-v1: geometric toggle-paint reward plus ±20 terminal reward."""
+"""PPO curricula for fixed-map locomotion, pursuit, and static-target combat."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 import math
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -17,13 +17,13 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from ppo_models import (
-    BULLET_SLOTS, MAP_DIM, OBS_DIM, OBS_SCHEMA_VERSION,
-    MOVEMENT_ACTIONS, make_actor_critic,
+    ACTION_COUNT, BULLET_SLOTS, FIRE_ACTIONS, MAP_DIM, OBS_DIM,
+    NAV_OFFSET, OBS_SCHEMA_VERSION, STOP_ACTIONS, make_actor_critic,
 )
 
 
 CHANNEL_NAMES = (
-    "initiative", "paint_toggle", "terminal", "kill_quality", "example",
+    "initiative", "navigation", "terminal", "kill_quality", "shot_attempt",
     "precision", "knife", "dodge", "repeated_wall",
 )
 TRAIN_SEEDS = (11, 22, 33)
@@ -41,9 +41,25 @@ def atomic_torch_save(value, path):
 
 @dataclass(frozen=True)
 class Config:
-    stage: str = "paint-v1-directional128"
+    stage: str = "static-target-fixed-v1-joystick130"
     observation_schema: int = OBS_SCHEMA_VERSION
+    action_count: int = ACTION_COUNT
     opponent: str = "Laika"
+    training_opponent: str = "inert-fixed-seed-20260824"
+    episode_frames: int = 750
+    navigation_total: float = 0.5
+    success_base: float = 10.0
+    speed_bonus_max: float = 2.0
+    failure_reward: float = -10.0
+    shot_attempt_reward: float = 0.10
+    shot_attempt_cap: float = 0.50
+    map_name: str = "static-target-fixed-seed-20260824"
+    step_cost: float = 0.0
+    failure_rules: str = "self-death,double-death,timeout=-10"
+    initial_checkpoint: str = ""
+    actor_logit_scale_on_init: float = 1.0
+    direction_pretrain_epochs: int = 0
+    direction_pretrain_learning_rate: float = 1e-4
     envs: int = 64
     rollout_steps: int = 256
     total_steps: int = 5_000_000
@@ -65,11 +81,26 @@ class Config:
 
 
 class PpoVec:
-    def __init__(self, count: int, seed: int, library=Path("engine/target/release/libkf_engine.dylib")):
+    def __init__(self, count: int, seed: int, static_target=False, walking=False,
+                 walking_training=False, walking_map=1, pursuit=False,
+                 hunt=False, hunt_map="mixed", eval_laika=False,
+                 library=Path("engine/target/release/libkf_engine.dylib")):
         self.count = count
         self.lib = ctypes.CDLL(str(library.resolve()))
-        self.lib.kf_vec_new_ppo_paint_v1.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
-        self.lib.kf_vec_new_ppo_paint_v1.restype = ctypes.c_void_p
+        constructor_name = (
+            {"real": "kf_vec_new_hunt_v1", "room": "kf_vec_new_hunt_room_v1",
+             "mixed": "kf_vec_new_hunt_mixed_v1"}[hunt_map] if hunt else
+            "kf_vec_new_pursuit_v1" if pursuit else
+            "kf_vec_new_walking_train_v3" if walking_training else
+            f"kf_vec_new_walking_v{walking_map}" if walking else
+            "kf_vec_new_static_target_v1" if static_target else
+            "kf_vec_new_ppo_eval" if eval_laika else
+            "kf_vec_new_ppo_paint_v1"
+        )
+        constructor = getattr(self.lib, constructor_name)
+        fixed_map = (static_target or walking or pursuit or hunt) and not walking_training
+        constructor.argtypes = [ctypes.c_uint32] if fixed_map else [ctypes.c_uint32, ctypes.c_uint32]
+        constructor.restype = ctypes.c_void_p
         self.lib.kf_vec_obs_dim.restype = ctypes.c_uint32
         self.lib.kf_vec_bullet_slots.restype = ctypes.c_uint32
         self.lib.kf_vec_reward_channel_count.restype = ctypes.c_uint32
@@ -80,7 +111,7 @@ class PpoVec:
         expected = (OBS_DIM, BULLET_SLOTS, len(CHANNEL_NAMES))
         if native != expected:
             raise RuntimeError(f"native/Python schema mismatch: {native} != {expected}")
-        self.handle = self.lib.kf_vec_new_ppo_paint_v1(count, seed)
+        self.handle = constructor(count) if fixed_map else constructor(count, seed)
         if not self.handle:
             raise RuntimeError("kf_vec_new_ppo_paint_v1 failed")
         self.lib.kf_vec_step.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint16)]
@@ -96,6 +127,9 @@ class PpoVec:
         self.dones = self._view("kf_vec_dones", ctypes.c_uint8, (count,))
         self.terminals = self._view("kf_vec_terminals", ctypes.c_uint8, (count,))
         self.winners = self._view("kf_vec_winners", ctypes.c_int8, (count,))
+        self.walking_failure_reasons = self._view(
+            "kf_vec_walking_failure_reasons", ctypes.c_int8, (count,)
+        )
 
     def _view(self, name, ctype, shape):
         function = getattr(self.lib, name)
@@ -131,7 +165,7 @@ def collect_rollout(env, model, kind, config, device, starts, hidden):
     shape = (tmax, count)
     obs = np.empty(shape + (OBS_DIM,), np.float32)
     masks = np.empty(shape + (BULLET_SLOTS,), bool)
-    actions = np.empty(shape + (2,), np.int64)
+    actions = np.empty(shape, np.int64)
     logprob = np.empty(shape, np.float32)
     values = np.empty(shape, np.float32)
     next_values = np.empty(shape, np.float32)
@@ -154,22 +188,14 @@ def collect_rollout(env, model, kind, config, device, starts, hidden):
             ).view(1, count, 1)
             hidden_in[t] = hidden[0].cpu().numpy()
         obs_t, mask_t = tensors(current_obs, current_masks, device)
-        (movement_logits, fire_logits), value, next_hidden = model.step(
-            obs_t, mask_t, hidden
-        )
-        movement_distribution = Categorical(logits=movement_logits)
-        fire_distribution = Categorical(logits=fire_logits)
-        movement = movement_distribution.sample()
-        fire = fire_distribution.sample()
-        actions[t, :, 0] = movement.cpu().numpy()
-        actions[t, :, 1] = fire.cpu().numpy()
-        logprob[t] = (
-            movement_distribution.log_prob(movement)
-            + fire_distribution.log_prob(fire)
-        ).cpu().numpy()
+        logits, value, next_hidden = model.step(obs_t, mask_t, hidden)
+        distribution = Categorical(logits=logits)
+        action = distribution.sample()
+        actions[t] = action.cpu().numpy()
+        logprob[t] = distribution.log_prob(action).cpu().numpy()
         values[t] = value.cpu().numpy()
 
-        env.step(actions[t, :, 0] * 2 + actions[t, :, 1])
+        env.step(actions[t])
         rewards[t] = env.rewards
         channels[t] = env.channels
         diagnostics[t] = env.diagnostics
@@ -202,8 +228,8 @@ def collect_rollout(env, model, kind, config, device, starts, hidden):
     metrics = {
         "reward_mean": float(rewards.mean()),
         "reward_std": float(rewards.std()),
-        "fire_rate": float((actions[..., 1] == 1).mean()),
-        "stop_rate": float((actions[..., 0] == MOVEMENT_ACTIONS - 1).mean()),
+        "fire_rate": float((actions % 2 == 1).mean()),
+        "stop_rate": float(np.isin(actions, STOP_ACTIONS).mean()),
         "done_count": int(dones.sum()),
         "outcomes": outcome_counts,
         "phi_self_mean": float(diagnostics[..., 0].mean()),
@@ -225,7 +251,7 @@ def ppo_loss(model, batch, indices, config, device, recurrent):
         flat_masks = batch["masks"].reshape(-1, BULLET_SLOTS)[indices]
         logits, value, _ = model.step(*tensors(flat_obs, flat_masks, device))
         action = torch.as_tensor(
-            batch["actions"].reshape(-1, 2)[indices], device=device
+            batch["actions"].reshape(-1)[indices], device=device
         ).long()
         pick = lambda name: torch.as_tensor(batch[name].reshape(-1)[indices], device=device)
     else:
@@ -244,12 +270,12 @@ def ppo_loss(model, batch, indices, config, device, recurrent):
         hidden_t = torch.as_tensor(initial_hidden, device=device).unsqueeze(0)
         starts_t = torch.as_tensor(episode_starts, device=device, dtype=torch.bool)
         logits, value, _ = model.sequence(obs_t, masks_t, hidden_t, starts_t)
-        logits = tuple(head.flatten(0, 1) for head in logits)
+        logits = logits.flatten(0, 1)
         value = value.flatten()
         action = torch.as_tensor(np.stack([
             batch["actions"][start:start + length, env]
             for env, start in zip(env_indices, starts)
-        ]).reshape(-1, 2), device=device).long()
+        ]).reshape(-1), device=device).long()
         pick = lambda name: torch.as_tensor(np.stack([
             batch[name][start:start + length, env] for env, start in zip(env_indices, starts)
         ]).reshape(-1), device=device)
@@ -259,12 +285,8 @@ def ppo_loss(model, batch, indices, config, device, recurrent):
     advantage = pick("advantages")
     returns = pick("returns")
     advantage = (advantage - advantage.mean()) / advantage.std().clamp(min=1e-8)
-    movement_distribution = Categorical(logits=logits[0])
-    fire_distribution = Categorical(logits=logits[1])
-    new_logprob = (
-        movement_distribution.log_prob(action[:, 0])
-        + fire_distribution.log_prob(action[:, 1])
-    )
+    distribution = Categorical(logits=logits)
+    new_logprob = distribution.log_prob(action)
     ratio = (new_logprob - old_logprob).exp()
     policy_loss = -torch.minimum(
         ratio * advantage,
@@ -274,9 +296,7 @@ def ppo_loss(model, batch, indices, config, device, recurrent):
     value_loss = 0.5 * torch.maximum(
         (value - returns).square(), (clipped_value - returns).square()
     ).mean()
-    entropy = (
-        movement_distribution.entropy() + fire_distribution.entropy()
-    ).mean()
+    entropy = distribution.entropy().mean()
     loss = policy_loss + config.value_coefficient * value_loss - config.entropy_coefficient * entropy
     with torch.no_grad():
         log_ratio = new_logprob - old_logprob
@@ -337,7 +357,7 @@ def update_policy(model, optimiser, batch, kind, config, device, rng):
 
 @torch.inference_mode()
 def evaluate(model, kind, config, device):
-    env = PpoVec(config.eval_envs, EVAL_ENV_BASE)
+    env = PpoVec(config.eval_envs, EVAL_ENV_BASE, eval_laika=True)
     hidden = model.initial_hidden(config.eval_envs, device)
     starts = np.ones(config.eval_envs, bool)
     channel_total = np.zeros((config.eval_envs, len(CHANNEL_NAMES)), np.float64)
@@ -357,10 +377,8 @@ def evaluate(model, kind, config, device):
                     ~starts, device=device, dtype=torch.float32
                 ).view(1, config.eval_envs, 1)
             logits, _value, hidden = model.step(*tensors(current_obs, current_masks, device), hidden)
-            movement = logits[0].argmax(-1).cpu().numpy().astype(np.uint16)
-            fire = logits[1].argmax(-1).cpu().numpy().astype(np.uint8)
-            action = movement * 2 + fire
-            fired |= fire == 1
+            action = logits.argmax(-1).cpu().numpy().astype(np.uint16)
+            fired |= action % 2 == 1
             decisions += 1
             env.step(action)
             channel_total += env.channels
@@ -408,6 +426,195 @@ def evaluate(model, kind, config, device):
     }
 
 
+@torch.inference_mode()
+def evaluate_hunt(model, kind, config, device, hunt_map="real"):
+    """Exactly 100 deterministic episodes on one hunt map.
+
+    The fixed-Laika report is a side channel; this is the metric that says
+    whether the policy actually learned to run the maze down and shoot. The
+    two maps are reported separately: an average over the mix would hide the
+    easy half propping up the hard one.
+    """
+    env = PpoVec(config.eval_envs, 0, hunt=True, hunt_map=hunt_map)
+    hidden = model.initial_hidden(config.eval_envs, device)
+    starts = np.ones(config.eval_envs, bool)
+    decisions = np.zeros(config.eval_envs, np.int64)
+    fired = np.zeros(config.eval_envs, bool)
+    bfs_sum = np.zeros(config.eval_envs, np.float64)
+    bfs_count = np.zeros(config.eval_envs, np.int64)
+    bfs_min = np.full(config.eval_envs, np.inf, np.float64)
+    episodes = []
+    try:
+        while len(episodes) < config.eval_episodes:
+            obs = env.obs.copy()
+            masks = env.masks.astype(bool, copy=True)
+            if kind == "gru":
+                hidden = hidden * torch.as_tensor(
+                    ~starts, device=device, dtype=torch.float32
+                ).view(1, config.eval_envs, 1)
+            logits, _value, hidden = model.step(*tensors(obs, masks, device), hidden)
+            action = logits.argmax(-1).cpu().numpy().astype(np.uint16)
+            fired |= action % 2 == 1
+            decisions += 1
+            env.step(action)
+            bfs = env.obs[:, NAV_OFFSET + 4].astype(np.float64) * 22.0
+            settled = decisions % 4 == 0
+            bfs_sum[settled] += bfs[settled]
+            bfs_count[settled] += 1
+            bfs_min[settled] = np.minimum(bfs_min[settled], bfs[settled])
+            reward = env.rewards.copy()
+            done = env.dones.astype(bool).copy()
+            for index in np.flatnonzero(done):
+                winner = int(env.winners[index])
+                reason = int(env.walking_failure_reasons[index])
+                terminal = bool(env.terminals[index])
+                if winner == 0:
+                    outcome = "kill"
+                elif not terminal:
+                    outcome = "truncated"
+                elif reason in (1, 5):
+                    outcome = "rule_failure"
+                else:
+                    outcome = "suicide"
+                episodes.append({
+                    "outcome": outcome,
+                    "failure_reason": {1: "wall_or_slide", 5: "stop_or_stuck"}.get(reason, "none"),
+                    "decisions": int(decisions[index]),
+                    "fired": bool(fired[index]),
+                    "final_reward": float(reward[index]),
+                    "mean_bfs": float(bfs_sum[index] / max(bfs_count[index], 1)),
+                    "min_bfs": float(bfs_min[index]) if np.isfinite(bfs_min[index]) else 0.0,
+                })
+                decisions[index] = 0
+                fired[index] = False
+                bfs_sum[index] = 0.0
+                bfs_count[index] = 0
+                bfs_min[index] = np.inf
+            starts = done
+            env.reset_done()
+    finally:
+        env.close()
+    episodes = episodes[:config.eval_episodes]
+    counts = {k: 0 for k in ("kill", "suicide", "rule_failure", "truncated")}
+    for row in episodes:
+        counts[row["outcome"]] += 1
+    reasons = {}
+    for row in episodes:
+        if row["outcome"] == "rule_failure":
+            reasons[row["failure_reason"]] = reasons.get(row["failure_reason"], 0) + 1
+    return {
+        "episodes": len(episodes),
+        "outcomes": counts,
+        "kill_rate": counts["kill"] / max(len(episodes), 1),
+        "rule_failure_reasons": reasons,
+        "mean_decisions": float(np.mean([r["decisions"] for r in episodes])),
+        "episode_fire_rate": float(np.mean([r["fired"] for r in episodes])),
+        "mean_bfs": float(np.mean([r["mean_bfs"] for r in episodes])),
+        "min_bfs_mean": float(np.mean([r["min_bfs"] for r in episodes])),
+    }
+
+
+@torch.inference_mode()
+def evaluate_walking(model, kind, config, device, walking_map=1, pursuit=False):
+    """Exactly 100 deterministic episodes on the curriculum acceptance map."""
+    env = PpoVec(
+        config.eval_envs, 0, walking=not pursuit,
+        walking_map=walking_map, pursuit=pursuit,
+    )
+    hidden = model.initial_hidden(config.eval_envs, device)
+    starts = np.ones(config.eval_envs, bool)
+    decisions = np.zeros(config.eval_envs, np.int64)
+    fired = np.zeros(config.eval_envs, bool)
+    bfs_sum = np.zeros(config.eval_envs, np.float64)
+    bfs_count = np.zeros(config.eval_envs, np.int64)
+    bfs_min = np.full(config.eval_envs, np.inf, np.float64)
+    bfs_final = np.zeros(config.eval_envs, np.float64)
+    episodes = []
+    try:
+        while len(episodes) < config.eval_episodes:
+            obs = env.obs.copy()
+            masks = env.masks.astype(bool, copy=True)
+            if kind == "gru":
+                hidden = hidden * torch.as_tensor(
+                    ~starts, device=device, dtype=torch.float32
+                ).view(1, config.eval_envs, 1)
+            logits, _value, hidden = model.step(*tensors(obs, masks, device), hidden)
+            action = logits.argmax(-1).cpu().numpy().astype(np.uint16)
+            fired |= action % 2 == 1
+            decisions += 1
+            env.step(action)
+            if pursuit:
+                bfs = env.obs[:, NAV_OFFSET + 4].astype(np.float64) * 22.0
+                settled = decisions % 4 == 0
+                bfs_sum[settled] += bfs[settled]
+                bfs_count[settled] += 1
+                bfs_min[settled] = np.minimum(bfs_min[settled], bfs[settled])
+                bfs_final[:] = bfs
+            done = env.dones.astype(bool).copy()
+            for index in np.flatnonzero(done):
+                winner = int(env.winners[index])
+                reason = int(env.walking_failure_reasons[index])
+                row = {
+                    "outcome": (
+                        "failed" if pursuit and winner == 1 else
+                        "completed" if pursuit else
+                        "arrived" if winner == 0 else
+                        "failed" if winner == 1 else "timeout"
+                    ),
+                    "failure_reason": {1: "wall", 2: "heading", 3: "fire", 4: "timeout", 5: "stop", 6: "route_direction"}.get(reason, "none"),
+                    "decisions": int(decisions[index]),
+                    "fired": bool(fired[index]),
+                }
+                if pursuit:
+                    count = max(int(bfs_count[index]), 1)
+                    row.update({
+                        "bfs_mean": float(bfs_sum[index] / count),
+                        "bfs_min": float(bfs_min[index]) if bfs_count[index] else float(bfs_final[index]),
+                        "bfs_final": float(bfs_final[index]),
+                    })
+                episodes.append(row)
+                decisions[index] = 0
+                fired[index] = False
+                bfs_sum[index] = 0.0
+                bfs_count[index] = 0
+                bfs_min[index] = np.inf
+                bfs_final[index] = 0.0
+            env.reset_done()
+            starts = done
+    finally:
+        env.close()
+    episodes = episodes[:config.eval_episodes]
+    outcome_keys = ("completed", "failed") if pursuit else ("arrived", "failed", "timeout")
+    outcomes = {key: sum(row["outcome"] == key for row in episodes)
+                for key in outcome_keys}
+    failure_reasons = {key: sum(row["failure_reason"] == key for row in episodes)
+                       for key in ("wall", "heading", "fire", "stop", "route_direction", "timeout")}
+    result = {
+        "episodes": len(episodes),
+        "map": (
+            "walking-v1-upper-right-room-irregular-laika-seed-20260827"
+            if pursuit else
+            "walking-v2-seven-by-four-five-turn-seed-20260826"
+            if walking_map == 2 else
+            "walking-v1-six-by-three-serpentine-seed-20260825"
+        ),
+        "outcomes": outcomes,
+        "failure_reasons": failure_reasons,
+        "fire_rate": float(np.mean([row["fired"] for row in episodes])),
+        "decisions_mean": float(np.mean([row["decisions"] for row in episodes])),
+    }
+    if pursuit:
+        result.update({
+            "completion_rate": outcomes["completed"] / len(episodes),
+            "bfs_mean": float(np.mean([row["bfs_mean"] for row in episodes])),
+            "bfs_min_mean": float(np.mean([row["bfs_min"] for row in episodes])),
+            "bfs_final_mean": float(np.mean([row["bfs_final"] for row in episodes])),
+        })
+    else:
+        result["arrival_rate"] = outcomes["arrived"] / len(episodes)
+    return result
+
+
 def append_jsonl(path, value):
     with path.open("a") as stream:
         stream.write(json.dumps(value, ensure_ascii=False) + "\n")
@@ -429,36 +636,199 @@ def select_device(choice):
     return torch.device("cpu")
 
 
+def pretrain_pursuit_direction(model, kind, optimiser, config, device):
+    """Teach the frozen route-action mapping on one exact 300-frame oracle trace."""
+    if kind != "nomem":
+        raise ValueError("the pursuit direction warm-up currently requires nomem")
+    env = PpoVec(1, 0, pursuit=True)
+    observations, masks, targets = [], [], []
+    previous_action = 90
+    try:
+        for frame in range(config.episode_frames):
+            observation = env.obs.copy()
+            route = observation[0, NAV_OFFSET:NAV_OFFSET + 4]
+            if route.max() > 0.5:
+                previous_action = int(route.argmax()) * 90
+            observations.append(observation[0])
+            masks.append(env.masks[0].copy())
+            targets.append(previous_action)
+            env.step(np.asarray([previous_action], np.uint16))
+            if env.dones[0] and frame + 1 != config.episode_frames:
+                reason = int(env.walking_failure_reasons[0])
+                raise RuntimeError(f"oracle failed at frame {frame + 1}, reason {reason}")
+    finally:
+        env.close()
+    observations = np.asarray(observations, np.float32)
+    masks = np.asarray(masks, bool)
+    targets = torch.as_tensor(targets, device=device, dtype=torch.long)
+    rng = np.random.default_rng(20_260_827)
+    model.train()
+    for epoch in range(config.direction_pretrain_epochs):
+        order = rng.permutation(len(observations))
+        for start in range(0, len(order), 64):
+            indices = order[start:start + 64]
+            optimiser.zero_grad(set_to_none=True)
+            logits, _value, _hidden = model.step(
+                *tensors(observations[indices], masks[indices], device),
+                model.initial_hidden(len(indices), device),
+            )
+            loss = F.cross_entropy(logits, targets[indices])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            optimiser.step()
+    model.eval()
+    with torch.no_grad():
+        logits, _value, _hidden = model.step(
+            *tensors(observations, masks, device),
+            model.initial_hidden(len(observations), device),
+        )
+        accuracy = float((logits.argmax(-1) == targets).float().mean())
+    print(
+        f"pursuit direction pretrain: {len(observations)} frames, "
+        f"{config.direction_pretrain_epochs} epochs, accuracy={accuracy:.3f}",
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, choices=("nomem", "gru"))
     parser.add_argument("--seed", required=True, type=int, choices=TRAIN_SEEDS)
-    parser.add_argument("--output", type=Path, default=Path("outputs/ppo_paint_v1_directional128"))
+    parser.add_argument(
+        "--curriculum", choices=("static-target", "walking", "pursuit", "hunt"),
+        default="static-target",
+    )
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--reevaluate", action="store_true")
+    parser.add_argument("--init-checkpoint", type=Path)
     args = parser.parse_args()
     device = select_device(args.device)
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     config = Config()
-    if args.smoke:
+    walking = args.curriculum == "walking"
+    pursuit = args.curriculum == "pursuit"
+    hunt = args.curriculum == "hunt"
+    locomotion = walking or pursuit
+    if walking:
         config = Config(
+            stage="walking-v6-transition-context-joystick130",
+            training_opponent="inert-walking-goal-varied-starts-same-map-seed-20260825",
+            episode_frames=300,
+            navigation_total=5.0,
+            success_base=10.0,
+            speed_bonus_max=0.0,
+            failure_reward=-10.0,
+            shot_attempt_reward=0.0,
+            shot_attempt_cap=0.0,
+            map_name="walking-v1-six-by-three-serpentine-seed-20260825",
+            step_cost=-0.002,
+            failure_rules="wall-or-slide,no-displacement,route-direction-mismatch,displacement-heading-mismatch,fire=-10;timeout=-10",
+            initial_checkpoint="outputs/ppo_walking_v5_waypoint_direction_joystick130/nomem/s11/final.pt",
+            learning_rate=1e-4,
+            total_steps=500_000,
+        )
+    elif pursuit:
+        config = Config(
+            stage="pursuit-v11-room-exp-bfs-joystick130",
+            training_opponent="unarmed-laika-irregular-two-dimensional-room-patrol",
+            episode_frames=300,
+            navigation_total=0.0,
+            success_base=0.0,
+            speed_bonus_max=0.0,
+            failure_reward=-10.0,
+            shot_attempt_reward=0.0,
+            shot_attempt_cap=0.0,
+            map_name="walking-v1-upper-right-two-by-two-room-seed-20260827",
+            step_cost=0.0,
+            failure_rules="wall-or-slide,no-displacement,fire=-10,stop=-10;forward-only-wheel-no-reverse;300-frame-horizon=truncation",
+            initial_checkpoint="outputs/ppo_walking_v6_transition_context_joystick130/nomem/s11/final.pt",
+            actor_logit_scale_on_init=0.5,
+            direction_pretrain_epochs=200,
+            learning_rate=1e-9,
+            total_steps=16_384,
+            entropy_coefficient=0.0,
+        )
+    elif hunt:
+        config = Config(
+            stage="hunt-v3-mixed-selfclosed-bfs-joystick258",
+            training_opponent="50-50-room-patrol-waypoints-and-scripted-random-walk-real-maze",
+            episode_frames=750,
+            navigation_total=0.0,
+            success_base=50.0,
+            speed_bonus_max=0.0,
+            failure_reward=-300.0,
+            shot_attempt_reward=0.0,
+            shot_attempt_cap=0.0,
+            map_name="50-50-mix:pursuit-room-seed-20260827-and-real-maze-seed-20260862",
+            step_cost=0.0,
+            failure_rules=(
+                "stop=-300,wall-or-slide=-300,no-displacement=-300;"
+                "kill-target=+50;own-ricochet-death=-300;"
+                "approach=+1-per-cell-the-policy-itself-closes-settled-every-frame;"
+                "fire-is-legal;750-frame-horizon=truncation"
+            ),
+            initial_checkpoint="",
+            learning_rate=3e-4,
+            total_steps=5_000_000,
+        )
+    if args.smoke:
+        config = replace(
+            config,
             total_steps=config.envs * config.rollout_steps * 2,
             eval_every_updates=0, eval_episodes=100,
         )
-    output = args.output / args.model / f"s{args.seed}"
+    output_root = args.output or Path(
+        "outputs/ppo_hunt_v3_mixed_selfclosed_joystick258" if hunt
+        else "outputs/ppo_pursuit_v11_room_exp_bfs_joystick130" if pursuit
+        else "outputs/ppo_walking_v6_transition_context_joystick130" if walking
+        else "outputs/ppo_static_target_fixed_v1_joystick130"
+    )
+    output = output_root / args.model / f"s{args.seed}"
     output.mkdir(parents=True, exist_ok=True)
-    config_dict = asdict(config) | {"model": args.model, "seed": args.seed, "device": str(device)}
+    config_dict = asdict(config)
+    if config.actor_logit_scale_on_init == 1.0:
+        config_dict.pop("actor_logit_scale_on_init")
+    config_dict |= {"model": args.model, "seed": args.seed, "device": str(device)}
+    if pursuit:
+        config_dict |= {
+            "proximity_reward": "every-4-frames:-exp(current_bfs-initial_bfs)",
+            "success_reward": "none; reaching Laika never ends the episode",
+            "target_motion": "irregular-horizontal-vertical-diagonal-patrol-in-upper-right-two-by-two-room",
+        }
     config_path = output / "config.json"
-    if config_path.exists() and json.loads(config_path.read_text()) != config_dict:
+    if (config_path.exists() and json.loads(config_path.read_text()) != config_dict
+            and not args.reevaluate):
         raise RuntimeError(f"refusing incompatible resume at {output}")
     config_path.write_text(json.dumps(config_dict, indent=2, ensure_ascii=False))
+    if args.reevaluate:
+        final_path = output / "final.pt"
+        saved = torch.load(final_path, map_location=device, weights_only=False)
+        model = make_actor_critic(args.model).to(device)
+        model.load_state_dict(saved["model"])
+        model.eval()
+        result = saved["result"]
+        result["config"] = config_dict
+        result["evaluation"] = evaluate(model, args.model, config, device)
+        if locomotion:
+            result["curriculum_evaluation"] = evaluate_walking(
+                model, args.model, config, device, pursuit=pursuit
+            )
+        (output / "complete.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
+        atomic_torch_save({"model": model.state_dict(), "result": result}, final_path)
+        print(json.dumps(result["evaluation"], ensure_ascii=False), flush=True)
+        return
     if (output / "complete.json").exists():
         print(f"已完成，跳过 {output}")
         return
 
     model = make_actor_critic(args.model).to(device)
+    if locomotion:
+        with torch.no_grad():
+            model.actor.bias[FIRE_ACTIONS] = -4.0
     optimiser = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1e-5)
     start_update = 0
     total_steps = 0
@@ -472,11 +842,45 @@ def main():
         torch.set_rng_state(saved["torch_rng"])
         if device.type == "mps" and saved.get("device_rng") is not None:
             torch.mps.set_rng_state(saved["device_rng"])
+    else:
+        init_checkpoint = args.init_checkpoint or (
+            Path(config.initial_checkpoint) if config.initial_checkpoint else None
+        )
+        if init_checkpoint is not None:
+            saved = torch.load(init_checkpoint, map_location=device, weights_only=False)
+            model.load_state_dict(saved["model"])
+            if config.actor_logit_scale_on_init != 1.0:
+                with torch.no_grad():
+                    model.actor.weight.mul_(config.actor_logit_scale_on_init)
+                    model.actor.bias.mul_(config.actor_logit_scale_on_init)
+                    model.actor.bias[FIRE_ACTIONS] = -8.0
+                    model.actor.bias[STOP_ACTIONS] = -8.0
+        if pursuit and config.direction_pretrain_epochs:
+            pretrain_optimiser = torch.optim.Adam(
+                model.parameters(),
+                lr=config.direction_pretrain_learning_rate,
+                eps=1e-5,
+            )
+            pretrain_pursuit_direction(
+                model, args.model, pretrain_optimiser, config, device
+            )
+            # The supervised direction stage must not leak Adam moments into PPO.
+            optimiser = torch.optim.Adam(
+                model.parameters(), lr=config.learning_rate, eps=1e-5
+            )
 
     steps_per_update = config.envs * config.rollout_steps
     updates = math.ceil(config.total_steps / steps_per_update)
     env_seed = TRAIN_ENV_BASE + args.seed * 10_000 + start_update * config.envs * 100
-    env = PpoVec(config.envs, env_seed)
+    env = PpoVec(
+        config.envs,
+        env_seed,
+        static_target=not (locomotion or hunt),
+        walking_training=walking,
+        pursuit=pursuit,
+        hunt=hunt,
+        hunt_map="mixed",
+    )
     starts = np.ones(config.envs, bool)
     hidden = model.initial_hidden(config.envs, device)
     started = time.perf_counter()
@@ -525,11 +929,20 @@ def main():
     model.eval()
     final_eval = evaluate(model, args.model, config, device)
     result = {
-        "name": f"ppo-paint-v1-directional128-{args.model}-s{args.seed}",
+        "name": f"ppo-{config.stage}-{args.model}-s{args.seed}",
         "model": args.model, "seed": args.seed, "total_steps": total_steps,
         "seconds_this_run": time.perf_counter() - started,
         "evaluation": final_eval, "config": config_dict,
     }
+    if locomotion:
+        result["curriculum_evaluation"] = evaluate_walking(
+            model, args.model, config, device, pursuit=pursuit
+        )
+    if hunt:
+        result["curriculum_evaluation"] = {
+            "room": evaluate_hunt(model, args.model, config, device, hunt_map="room"),
+            "real_maze": evaluate_hunt(model, args.model, config, device, hunt_map="real"),
+        }
     (output / "complete.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
     atomic_torch_save({"model": model.state_dict(), "result": result}, output / "final.pt")
 
