@@ -697,8 +697,19 @@ fn write_loadout(game: &Game, tank: usize, out: &mut [f32]) {
 }
 
 /// `[none, gatling, shotgun, shield, laser]`, matching `Weapon::code`.
+/// `[none, gatling, shotgun, shield, laser]`, matching `Weapon::code`.
+///
+/// A weapon this schema has no column for reads as all zeros, which is
+/// distinct from `Normal` setting index 0, rather than panicking on a slice it
+/// does not fit. Schema 25 was frozen before the homing missile existed and
+/// widening the one-hot would shift every channel after it — the one thing the
+/// layout promises never to do — so the missile is simply not named here. It
+/// is still fully visible as what it is: a bullet, in the bullet slots.
 fn weapon_one_hot(weapon: Weapon, out: &mut [f32]) {
-    out[weapon.code() as usize] = 1.0;
+    let slot = weapon.code() as usize;
+    if slot < out.len() {
+        out[slot] = 1.0;
+    }
 }
 
 #[cfg(test)]

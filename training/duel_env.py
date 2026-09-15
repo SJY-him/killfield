@@ -47,7 +47,8 @@ ETA_INDEX = 893
 OUTCOME_NAMES = {0: "running", 1: "win", 2: "loss", 3: "double", 4: "draw"}
 OPPONENT_NAMES = {0: "laika", 1: "mpc", 2: "frozen"}
 # `Weapon::code` in engine/src/pickups.rs. 0 means no drill.
-DRILL_WEAPONS = {"none": 0, "gatling": 1, "shotgun": 2, "shield": 3, "laser": 4}
+DRILL_WEAPONS = {"none": 0, "gatling": 1, "shotgun": 2, "shield": 3, "laser": 4,
+                 "homing": 5}
 
 def _default_library() -> Path:
     """cargo names the cdylib per platform; pick the one that is there."""

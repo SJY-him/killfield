@@ -96,6 +96,23 @@ pub const LASER_STEPS_PER_CELL: i32 = 16;
 pub const LASER_BEAM_FRAMES: i32 = 45;
 pub const LASER_BEAM_HOLD_FRAMES: i32 = 10;
 
+/// Homing missile: rounds per pickup, frames between them, how long each one
+/// chases, and how sharply it may turn while it does.
+///
+/// It is an ordinary bullet that steers, which is the whole design: it travels
+/// at a bullet's speed, bounces off walls on a bullet's rules, and is visible
+/// to every threat channel the observation already has. What it is not is a
+/// new kind of thing the engine has to learn about.
+///
+/// The turn rate is the difficulty dial. At five degrees a frame a missile can
+/// come about in a second and a half, so standing still is fatal and moving
+/// across its arc is not — which is the behaviour worth rewarding. Faster and
+/// it becomes unavoidable; slower and it flies past and never comes back.
+pub const HOMING_CHARGES: i32 = 2;
+pub const HOMING_COOLDOWN_FRAMES: i32 = 25;
+pub const HOMING_FRAMES: i32 = 125; // five seconds at 25 Hz
+pub const HOMING_TURN_DEGREES: f64 = 5.0;
+
 /// Shotgun: trigger pulls per pickup, pellets either side of the centre one,
 /// and the angle between neighbouring pellets.
 pub const SHOTGUN_CHARGES: i32 = 4;

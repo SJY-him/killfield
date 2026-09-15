@@ -182,7 +182,7 @@ def main():
                         help="checkpoint driving the frozen slots of the pool")
     parser.add_argument("--seed", type=int, default=9_000)
     parser.add_argument("--drill", default="none",
-                        choices=("none", "gatling", "shotgun", "shield", "laser"),
+                        choices=("none", "gatling", "shotgun", "shield", "laser", "homing"),
                         help="arm the opponent with this weapon every round, "
                              "with no crates involved")
     parser.add_argument("--pickups", action="store_true",

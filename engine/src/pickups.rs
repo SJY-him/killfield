@@ -40,14 +40,18 @@ pub enum Weapon {
     Shotgun,
     /// Not a gun: absorbs exactly one lethal hit, including your own ricochet.
     Shield,
-    /// An instant bouncing beam. See `laser.rs`.
+    /// A fast bouncing bolt. See `laser.rs`.
     Laser,
+    /// A bullet that steers toward the other tank for a few seconds.
+    Homing,
 }
 
 impl Weapon {
     /// The order crates roll from. `Normal` is excluded deliberately.
-    pub const DROPS: [Weapon; 4] =
-        [Weapon::Gatling, Weapon::Shotgun, Weapon::Shield, Weapon::Laser];
+    pub const DROPS: [Weapon; 5] = [
+        Weapon::Gatling, Weapon::Shotgun, Weapon::Shield, Weapon::Laser,
+        Weapon::Homing,
+    ];
 
     /// Wire encoding for the render buffer and the viewer.
     pub fn code(self) -> f32 {
@@ -57,6 +61,7 @@ impl Weapon {
             Weapon::Shotgun => 2.0,
             Weapon::Shield => 3.0,
             Weapon::Laser => 4.0,
+            Weapon::Homing => 5.0,
         }
     }
 
@@ -67,6 +72,7 @@ impl Weapon {
             Weapon::Gatling => C::GATLING_CHARGES,
             Weapon::Shotgun => C::SHOTGUN_CHARGES,
             Weapon::Laser => C::LASER_CHARGES,
+            Weapon::Homing => C::HOMING_CHARGES,
         }
     }
 
@@ -76,6 +82,7 @@ impl Weapon {
         match self {
             Weapon::Gatling => C::GATLING_COOLDOWN_FRAMES,
             Weapon::Laser => C::LASER_COOLDOWN_FRAMES,
+            Weapon::Homing => C::HOMING_COOLDOWN_FRAMES,
             _ => 0,
         }
     }

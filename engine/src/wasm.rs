@@ -304,7 +304,8 @@ pub unsafe extern "C" fn kf_laser_preview(h: *mut Handle, tank: u32, rotation: f
 /// For trying a weapon out without waiting on a random drop — the viewer wires
 /// it to a `?weapon=` query parameter, the same debug-hook convention
 /// `?pilot=policy` already uses. Codes match `pickups::Weapon::code`:
-/// 0 clears back to the default gun, 1 gatling, 2 shotgun, 3 shield, 4 laser.
+/// 0 clears back to the default gun, 1 gatling, 2 shotgun, 3 shield, 4 laser,
+/// 5 homing missile.
 ///
 /// # Safety
 /// `h` must come from `kf_new`.
@@ -321,6 +322,7 @@ pub unsafe extern "C" fn kf_set_weapon(h: *mut Handle, tank: u32, code: u32) {
         2 => Weapon::Shotgun,
         3 => Weapon::Shield,
         4 => Weapon::Laser,
+        5 => Weapon::Homing,
         _ => Weapon::Normal,
     };
     if weapon == Weapon::Shield {

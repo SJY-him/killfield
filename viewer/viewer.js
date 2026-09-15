@@ -65,7 +65,7 @@ const POLICY_PILOT = QUERY.get("pilot") === "policy";
 /** `?weapon=laser` (or gatling/shotgun/shield) hands the human that weapon at
  *  the start of every round, so a weapon can be tried without waiting on a
  *  random crate. Same debug-hook convention as `?pilot=policy`. */
-const FORCED_WEAPONS = { gatling: 1, shotgun: 2, shield: 3, laser: 4 };
+const FORCED_WEAPONS = { gatling: 1, shotgun: 2, shield: 3, laser: 4, homing: 5 };
 const FORCED_WEAPON = FORCED_WEAPONS[QUERY.get("weapon")] ?? null;
 const requestedPilotTarget = Number(QUERY.get("target"));
 const POLICY_PILOT_TARGET = Number.isInteger(requestedPilotTarget)
@@ -365,6 +365,7 @@ const WEAPON_GATLING = 1;
 const WEAPON_SHOTGUN = 2;
 const WEAPON_SHIELD = 3;
 const WEAPON_LASER = 4;
+const WEAPON_HOMING = 5;
 
 /**
  * The aiming line for a loaded laser: the exact path `laser::trace` says the
@@ -436,6 +437,14 @@ function drawPickup(ctx, x, y, weapon, scale) {
     ctx.moveTo(-r * 0.55, r * 0.45);
     ctx.lineTo(r * 0.1, -r * 0.1);
     ctx.lineTo(r * 0.55, r * 0.2);
+  } else if (weapon === WEAPON_HOMING) {
+    // A curving track with a head on it: the one weapon that does not fly
+    // straight, drawn as the thing that makes it different.
+    ctx.moveTo(-r * 0.55, r * 0.5);
+    ctx.quadraticCurveTo(r * 0.5, r * 0.45, r * 0.25, -r * 0.5);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(r * 0.25, -r * 0.5, r * 0.16, 0, Math.PI * 2);
   }
   ctx.stroke();
   ctx.restore();
@@ -458,7 +467,7 @@ function drawLoadout(ctx, x, y, weapon, shield, scale, color) {
   ctx.fillStyle = color.turret;
   ctx.strokeStyle = THEME.page;
   ctx.lineWidth = 1;
-  const pips = weapon === WEAPON_GATLING ? 3 : 2;
+  const pips = weapon === WEAPON_HOMING ? 4 : weapon === WEAPON_GATLING ? 3 : 2;
   const step = scale * 0.09;
   for (let i = 0; i < pips; i += 1) {
     ctx.beginPath();
@@ -1346,7 +1355,7 @@ function toggleLanguage() {
 
 async function boot() {
   const [wasmBytes, hybrid] = await Promise.all([
-    fetch("kf_engine.wasm?v=f2fee6b8").then((res) => res.arrayBuffer()),
+    fetch("kf_engine.wasm?v=b25c91e6").then((res) => res.arrayBuffer()),
     HybridPolicy.load("assets/hybrid.json?v=a1ab1f63", "assets/hybrid.bin?v=96169340"),
   ]);
   // Hashed before instantiation so a record names the exact binaries it is

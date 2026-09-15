@@ -15,6 +15,7 @@ pub mod field;
 pub mod ffi;
 pub mod ffi_duel;
 pub mod game;
+pub mod homing;
 pub mod laika;
 pub mod laser;
 pub mod maze;

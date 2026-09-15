@@ -492,6 +492,7 @@ pub extern "C" fn kf_duel_new_drill(
         2 => Some(Weapon::Shotgun),
         3 => Some(Weapon::Shield),
         4 => Some(Weapon::Laser),
+        5 => Some(Weapon::Homing),
         _ => None,
     };
     new_env(count, base_seed, laika_permille, mpc_permille, frozen_permille,

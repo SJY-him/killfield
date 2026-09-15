@@ -436,6 +436,9 @@ pub struct Bullet {
     /// A bullet is harmless to whoever fired it until it has bounced at least
     /// once. That is the actual rule, not a workaround for the muzzle overlap.
     pub has_bounced: bool,
+    /// Frames this round will still steer toward the other tank for. Zero on
+    /// everything but a homing missile; see `homing.rs`.
+    pub homing_frames: i32,
     /// A laser bolt: an ordinary round in every respect except that it travels
     /// `LASER_SPEED_MULTIPLIER` times faster and expires at the end of its
     /// range rather than after ten seconds. Carried so a kill can be
@@ -467,6 +470,7 @@ impl Bullet {
             removed: false,
             just_created: false,
             has_bounced: false,
+            homing_frames: 0,
             laser: false,
             injected: false,
         }
@@ -755,6 +759,8 @@ impl Game {
         // hit and the expiry paths decrement. Only speed and range differ.
         if self.tanks[tank].weapon == Weapon::Laser {
             laser::make_bolt(&mut b);
+        } else if self.tanks[tank].weapon == Weapon::Homing {
+            crate::homing::make_missile(&mut b);
         }
         // Flash gave a freshly attached clip its first frame event on the NEXT
         // tick, so a bullet does not move on the frame it was fired.
@@ -1182,6 +1188,9 @@ pub fn bullet_update(g: &mut Game, idx: usize) {
         return;
     }
     let mut b = g.bullets[idx];
+    // Before the substeps, so the curve is a chord per frame rather than the
+    // velocity changing underneath a half-finished step.
+    crate::homing::steer(g, &mut b);
 
     // A bolt is faster because it takes more substeps, not longer ones. Making
     // the steps longer instead was the first attempt and it tunnelled: at
